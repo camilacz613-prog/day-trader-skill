@@ -521,3 +521,150 @@ class Cli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def short_order(**over):
+    o = {"symbol": "TSLA", "side": "sell", "qty": "8", "type": "market", "time_in_force": "day",
+         "order_class": "bracket", "take_profit_limit_price": "352.46", "stop_loss_stop_price": "370.04",
+         "plan": {"entry": 364.18, "stop": 370.04, "target": 352.46}}
+    o.update(over)
+    return o
+
+
+def gold_order(**over):
+    o = {"symbol": "GC=F", "side": "sell", "qty": "5.06", "type": "market", "time_in_force": "day",
+         "order_class": "bracket", "take_profit_limit_price": "4131.60", "stop_loss_stop_price": "4151.55",
+         "plan": {"entry": 4144.90, "stop": 4151.55, "target": 4131.60, "market": "24h",
+                  "session": {"kind": "24h", "open": "08:20", "close": "17:00", "weekends": False}}}
+    o.update(over)
+    return o
+
+
+GOLD = dict(budget=3000, fx_rate=1.1236, max_loss_per_trade_pct=1, leverage=500, allow_short=True, allow_24h=True)
+GOLD_NOW = "2026-10-21 09:00"
+
+
+class ShortSide(unittest.TestCase):
+    def test_a_short_is_blocked_until_you_allow_it(self):
+        res = check.check([short_order()], cfg(), now=at(NOW))
+        self.assertEqual(verdicts(res), ["BLOCK"])
+        self.assertIn("short selling is off", reasons(res))
+
+    def test_an_allowed_short_passes_with_the_stop_above(self):
+        res = check.check([short_order()], cfg(allow_short=True), now=at(NOW))
+        r = res["results"][0]
+        self.assertEqual((r["verdict"], r["kind"]), ("PASS", "entry"), r["reasons"])
+        self.assertEqual((r["entry_ref"], r["stop"], r["target"], r["risk_per_share"], r["max_loss"], r["reward_risk"]),
+                         (364.18, 370.04, 352.46, 5.86, 46.88, 2.0))
+
+    def test_a_stop_below_a_short_entry_is_blocked(self):
+        res = check.check([short_order(stop_loss_stop_price="358.32")], cfg(allow_short=True), now=at(NOW))
+        self.assertEqual(verdicts(res), ["BLOCK"])
+        self.assertIn("must be above the entry", reasons(res))
+
+    def test_a_target_above_a_short_entry_is_blocked(self):
+        res = check.check([short_order(take_profit_limit_price="370.00")], cfg(allow_short=True), now=at(NOW))
+        self.assertIn("target: the target 370.00 must be below the entry", reasons(res))
+
+    def test_a_price_that_fell_since_the_plan_is_the_short_s_reference(self):
+        res = check.check([short_order()], cfg(allow_short=True), prices={"TSLA": 362.0}, now=at(NOW))
+        r = res["results"][0]
+        self.assertEqual((r["entry_ref"], r["entry_ref_from"]), (362.0, "price"))
+        self.assertEqual(r["risk_per_share"], 8.04)
+        self.assertIn("loss:", reasons(res))                         # 8 x 8.04 = 64.32 over the $50 limit
+
+    def test_a_short_needs_its_margin_in_cash(self):
+        res = check.check([short_order(qty="10")], cfg(allow_short=True, budget=2000, max_position_pct=100,
+                                                       max_loss_per_trade_usd=100, max_order_usd=5000),
+                          now=at(NOW))
+        self.assertIn("cash: needs", reasons(res))
+
+    def test_two_shorts_share_one_margin_pool(self):
+        o1 = short_order(qty="7")
+        o2 = short_order(symbol="NVDA", qty="7", take_profit_limit_price="352.46",
+                         plan={"entry": 364.18, "stop": 370.04, "target": 352.46})
+        res = check.check([o1, o2], cfg(allow_short=True, budget=4000, max_position_pct=100, cash_buffer_pct=10),
+                          now=at(NOW))
+        self.assertEqual(verdicts(res), ["PASS", "BLOCK"])
+        self.assertIn("cash:", reasons(res, 1))
+
+    def test_buying_back_a_short_is_an_exit(self):
+        pf = {"cash": 5000, "positions": [{"ticker": "TSLA", "shares": -8, "lots": []}]}
+        o = {"symbol": "TSLA", "side": "buy", "qty": "8", "type": "market", "time_in_force": "day"}
+        res = check.check([o], cfg(allow_short=True), pf, {"TSLA": 360.0}, now=at("2026-10-19 16:30"))
+        self.assertEqual((res["results"][0]["verdict"], res["results"][0]["kind"]), ("PASS", "exit"))
+
+
+class Market24h(unittest.TestCase):
+    def test_a_24h_order_is_off_by_default(self):
+        res = check.check([gold_order()], cfg(**dict(GOLD, allow_24h=False)), now=at(GOLD_NOW))
+        self.assertEqual(verdicts(res), ["BLOCK"])
+        self.assertIn("24h-market order", reasons(res))
+        self.assertIn("allow_24h", reasons(res))
+
+    def test_the_gold_short_passes_at_1_to_500_with_1_percent_risk(self):
+        res = check.check([gold_order()], cfg(**GOLD), now=at(GOLD_NOW))
+        r = res["results"][0]
+        self.assertEqual(r["verdict"], "PASS", r["reasons"])
+        self.assertEqual((r["max_loss"], r["risk_per_share"], r["reward_risk"]), (33.65, 6.65, 2.0))
+        self.assertTrue(any("24h market" in w for w in r["warnings"]))
+        self.assertTrue(any("fractional units" in w for w in r["warnings"]))
+        self.assertTrue(any("no holiday calendar" in w for w in r["warnings"]))
+
+    def test_one_percent_of_the_budget_is_the_loss_limit(self):
+        res = check.check([gold_order(qty="5.1")], cfg(**GOLD), now=at(GOLD_NOW))      # 5.1 x 6.65 = 33.915
+        self.assertEqual(verdicts(res), ["BLOCK"])
+        self.assertIn("over your $33.71 max loss per trade", reasons(res))
+        res = check.check([gold_order(qty="5.06")], cfg(**dict(GOLD, max_loss_per_trade_pct=0.9)), now=at(GOLD_NOW))
+        self.assertIn("over your $30.34 max loss per trade", reasons(res))
+
+    def test_the_margin_not_the_notional_counts_against_the_caps(self):
+        # 5.06 units x 4144.90 = $20,973 notional, but only $41.95 of margin at 1:500
+        res = check.check([gold_order()], cfg(**GOLD), now=at(GOLD_NOW))
+        self.assertEqual(res["results"][0]["verdict"], "PASS")
+        res = check.check([gold_order()], cfg(**dict(GOLD, leverage=1)), now=at(GOLD_NOW))
+        self.assertEqual(verdicts(res), ["BLOCK"])
+        self.assertIn("size:", reasons(res))
+
+    def test_the_window_is_the_plan_s_own_session(self):
+        for when, ok in (("2026-10-21 08:00", False), ("2026-10-21 08:20", True), ("2026-10-21 16:30", True),
+                         ("2026-10-21 16:31", False), ("2026-10-21 17:30", False), ("2026-10-24 10:00", False)):
+            res = check.check([gold_order()], cfg(**GOLD), now=at(when))
+            self.assertEqual(res["results"][0]["verdict"] == "PASS", ok, (when, res["results"][0]["reasons"]))
+        res = check.check([gold_order()], cfg(**GOLD), now=at("2026-10-21 16:45"))
+        self.assertIn("no new entries after 16:30", reasons(res))
+        res = check.check([gold_order()], cfg(**GOLD), now=at("2026-10-21 05:00"))
+        self.assertIn("the 24h session is closed", reasons(res))
+
+    def test_config_moves_the_24h_window(self):
+        res = check.check([gold_order()], cfg(**dict(GOLD, no_entries_after_24h="12:00")), now=at("2026-10-21 12:30"))
+        self.assertIn("no new entries after 12:00", reasons(res))
+        res = check.check([gold_order()], cfg(**dict(GOLD, no_entries_before_24h="09:00")), now=at("2026-10-21 08:30"))
+        self.assertIn("no new entries before 09:00", reasons(res))
+
+    def test_an_overnight_session_and_weekends(self):
+        o = gold_order(plan={"entry": 4144.90, "stop": 4151.55, "target": 4131.60, "market": "24h",
+                             "session": {"kind": "24h", "open": "22:00", "close": "05:00", "weekends": False}})
+        res = check.check([o], cfg(**GOLD), now=at("2026-10-21 01:00"))              # Wed 01:00: Tue's session
+        self.assertEqual(res["results"][0]["verdict"], "PASS", res["results"][0]["reasons"])
+        res = check.check([o], cfg(**GOLD), now=at("2026-10-24 23:00"))              # Saturday night
+        self.assertEqual(verdicts(res), ["BLOCK"])
+        o["plan"]["session"]["weekends"] = True
+        res = check.check([o], cfg(**GOLD), now=at("2026-10-24 23:00"))
+        self.assertEqual(res["results"][0]["verdict"], "PASS", res["results"][0]["reasons"])
+
+    def test_symbols_that_are_not_yahoo_symbols_stay_blocked(self):
+        res = check.check([gold_order(symbol="GC F!")], cfg(**GOLD), now=at(GOLD_NOW))
+        self.assertIn("does not look like a Yahoo symbol", reasons(res))
+        # without a 24h plan a futures symbol is still not a stock
+        o = gold_order(symbol="GC=F")
+        o["plan"] = {"entry": 4144.90, "stop": 4151.55, "target": 4131.60}
+        res = check.check([o], cfg(**GOLD), now=at(GOLD_NOW))
+        self.assertIn("stocks and ETFs only", reasons(res))
+
+    def test_bad_money_settings(self):
+        for over, word in ((dict(fx_rate=0), "fx_rate"), (dict(leverage=0.5), "leverage"),
+                           (dict(max_loss_per_trade_pct=200), "at most 100")):
+            with self.assertRaises(check.RiskError) as e:
+                check.check([gold_order()], cfg(**dict(GOLD, **over)), now=at(GOLD_NOW))
+            self.assertIn(word, str(e.exception))
