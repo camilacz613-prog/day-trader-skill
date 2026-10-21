@@ -3,7 +3,8 @@ name: trader-alerts
 description: >-
   Price Alerts. Rings when a price, a stop or the opening bell hits. Turns
   the trade plan into three alerts in one go (the stop, the target and "flat
-  by close" at your flat-by time), plus above / below / stop / target levels,
+  by close" at your flat-by time; mirrored for a short, and following a 24h
+  market's own session), plus above / below / stop / target levels,
   percent moves from the previous close, any time of day, and the NYSE
   opening bell, each ringing once so you are not spammed. Knows NYSE hours
   with the 2026 and 2027 holidays and 1:00 p.m. early closes, works out New
@@ -100,6 +101,17 @@ on these holidays, from nyse.com/markets/hours-calendars (read 2026-10-13):
 Daylight saving time is worked out in the tool, so it needs no time zone
 files and ignores the computer's own zone. For any other year it says the
 holiday list is unknown.
+
+## Short side and 24h markets
+
+- **Short.** A stop or target rule with `"side": "sell"` is mirrored: the stop rings when the price is at or
+  ABOVE it, the target when it is at or below. `add --from-plan` sets this from a plan with `"side": "sell"`;
+  by hand: `add --symbol TSLA --stop 370.04 --side sell`. The flat-by message offers the buy-to-cover ticket.
+- **24h markets.** Rules from a plan with `"market": "24h"` carry the plan's session and are watched for that
+  session only, even across midnight; the flat-by time rings when the New York clock passes it inside the
+  session, with no NYSE calendar. `alerts.py clock --market 24h --anchor 08:20 --close 17:00` says whether such
+  a session is open. Quotes work for any Yahoo symbol (`GC=F`, `EURUSD=X`, `BTC-USD`), delayed and
+  unofficial like the rest.
 
 ## Steps
 

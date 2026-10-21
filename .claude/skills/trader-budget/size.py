@@ -29,6 +29,24 @@ bigger loss at the same stop. Zero shares (the stop is too far away for your
 max loss) is a plain refusal: no order is written. So is a reward:risk under
 min_reward_risk (the price ran toward the target since the plan).
 
+Short side: a plan with "side": "sell" (stop above the entry, target below) is sized the
+same way and written as a "sell" bracket order. trader-risk blocks it unless "allow_short"
+is true. For a short a price that fell since the plan means a bigger risk, so a fresh
+price under the plan's entry is what a market order sizes at.
+
+Leverage, currency and unit size (all optional; the defaults reproduce the plain stock sizing):
+  leverage                 1 by default. Above 1 the position cap, max order and cash limits
+                           count the MARGIN the position ties up (notional / leverage), not the
+                           notional; the max loss limit still counts the whole stop distance.
+  fx_rate                  1 by default. Your money settings (budget, max loss, caps) are in your
+                           account currency; fx_rate is how many units of the instrument's currency
+                           one unit of the account currency buys (3,000 EUR with EURUSD 1.1236 is
+                           $3,370.80), so the sizing and the report run in the instrument's currency.
+  max_loss_per_trade_pct   a percent of the budget; when set it replaces max_loss_per_trade_usd.
+  qty_step                 1 by default (whole shares). 0.01 sizes in hundredths, for a CFD or a
+                           broker that sells fractions; the size rounds DOWN to the step.
+  min_qty                  the smallest order, in units (default: the step).
+
 Weights mode (kept from v1, no longer the headline): split a budget across a
 list of stocks by weight.
 
@@ -82,6 +100,11 @@ DEFAULTS = {
     "allow_margin": False,
     "allow_short": False,
     "pdt_guard": False,
+    "leverage": 1,
+    "fx_rate": 1,
+    "max_loss_per_trade_pct": None,
+    "qty_step": 1,
+    "min_qty": None,
 }
 EPS = 1e-9
 FRESH_MINUTES = 15
@@ -272,12 +295,24 @@ def round_cent(x):
     return math.floor(float(x) * 100 + 0.5 + EPS) / 100.0
 
 
-def shares_for(usd, per_share):
-    """Whole shares that fit in usd at per_share, in exact integer cents."""
+def shares_for(usd, per_share, step=1):
+    """Whole shares (or whole steps, e.g. 0.01) that fit in usd at per_share, in exact integer cents."""
     u, p = int(round(float(usd) * 100)), int(round(float(per_share) * 100))
     if p <= 0 or u <= 0:
         return 0
-    return u // p
+    if step == 1:
+        return u // p
+    from fractions import Fraction
+    st = Fraction(str(step))
+    return float((Fraction(u, p) // st) * st)
+
+
+def qty_text(q, step=1):
+    """The quantity as Alpaca-style string: 8, or 5.07 for a 0.01 step."""
+    if step == 1:
+        return str(int(q))
+    digits = max(0, -(__import__("decimal").Decimal(str(step)).as_tuple().exponent))
+    return ("%.*f" % (digits, q)).rstrip("0").rstrip(".") if digits else str(int(q))
 
 
 def _price(x):
@@ -317,8 +352,10 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     if not sym:
         raise SizeError("the plan has no symbol (run trader-exit)")
     side = str(plan.get("side") or "buy").strip().lower()
-    if side != "buy":
-        raise SizeError("this pack sizes long (buy) day trades only; the plan says %r" % side)
+    side = {"long": "buy", "short": "sell"}.get(side, side)
+    if side not in ("buy", "sell"):
+        raise SizeError("the plan's side is buy or sell (short), not %r" % side)
+    short_side = side == "sell"
     if today and plan.get("date") and str(plan["date"]) != today:
         raise SizeError("the plan is for %s and today is %s in New York: make a new plan with trader-exit"
                         % (plan["date"], today))
@@ -331,28 +368,53 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     if sym in blocked:
         raise SizeError("%s is on your blocked list" % sym)
 
-    budget = float(budget if budget is not None else (c.get("budget") or 0))
-    if budget <= 0:
+    fx = 1.0 if c.get("fx_rate") is None else _f(c.get("fx_rate"))
+    if fx is None or fx <= 0:
+        raise SizeError("fx_rate must be above 0")
+    lev = 1.0 if c.get("leverage") is None else _f(c.get("leverage"))
+    if lev is None or lev < 1:
+        raise SizeError("leverage must be 1 or more")
+    step = 1 if c.get("qty_step") is None else _f(c.get("qty_step"))
+    if step is None or step <= 0 or (step >= 1 and step != int(step)):
+        raise SizeError("qty_step is 1 (whole units) or a fraction like 0.01")
+    step = int(step) if step == int(step) else step
+
+    budget_acct = float(budget if budget is not None else (c.get("budget") or 0))
+    if budget_acct <= 0:
         raise SizeError("no budget: pass --budget or set \"budget\" in trader/config.json")
+    budget = round(budget_acct * fx, 2)                    # in the instrument's currency from here on
     buf_pct = float(c.get("cash_buffer_pct") or 0)
     if not 0 <= buf_pct < 100:
         raise SizeError("cash_buffer_pct must be between 0 and 100")
+    if cash is not None:
+        cash = cash * fx
 
     if limit is not None:
         ref, ref_from = round_cent(limit), "limit"
-    elif price is not None and round_cent(price) > round_cent(entry_plan):
+    elif price is not None and (round_cent(price) < round_cent(entry_plan) if short_side
+                                else round_cent(price) > round_cent(entry_plan)):
         ref, ref_from = round_cent(price), "price"
     else:
         ref, ref_from = round_cent(entry_plan), "plan"
     stop, target = round_cent(stop), round_cent(target)
-    if stop >= ref:
-        raise SizeError("the stop %s is not below the entry %s; a long trade needs its stop underneath"
-                        % (_price(stop), _price(ref)))
-    if target <= ref:
-        raise SizeError("the target %s is not above the entry %s: the move has already happened. "
-                        "Skip it or make a new plan with trader-exit" % (_price(target), _price(ref)))
-    risk_c = int(round((ref - stop) * 100))
-    reward_c = int(round((target - ref) * 100))
+    if short_side:
+        if stop <= ref:
+            raise SizeError("the stop %s is not above the entry %s; a short trade needs its stop above"
+                            % (_price(stop), _price(ref)))
+        if target >= ref:
+            raise SizeError("the target %s is not below the entry %s: the move has already happened. "
+                            "Skip it or make a new plan with trader-exit" % (_price(target), _price(ref)))
+        risk_c = int(round((stop - ref) * 100))
+        reward_c = int(round((ref - target) * 100))
+    else:
+        if stop >= ref:
+            raise SizeError("the stop %s is not below the entry %s; a long trade needs its stop underneath"
+                            % (_price(stop), _price(ref)))
+        if target <= ref:
+            raise SizeError("the target %s is not above the entry %s: the move has already happened. "
+                            "Skip it or make a new plan with trader-exit" % (_price(target), _price(ref)))
+        risk_c = int(round((ref - stop) * 100))
+        reward_c = int(round((target - ref) * 100))
     risk = risk_c / 100.0
 
     cash_buffer = round(budget * buf_pct / 100.0, 2)
@@ -363,35 +425,59 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         cash_note = "cash %s in trader/portfolio.json minus the %s buffer" % (money(cash), money(cash_buffer))
     available = max(round(available, 2), 0.0)
 
+    # money tied up per unit: the whole price, or price / leverage when you trade on margin
+    tied = round(ref / lev, 4) if lev > 1 else ref
+    tied_c = ref / lev if lev > 1 else ref
+    where = " margin" if lev > 1 else ""
+    per_how = ("%s / %g leverage = %s" % (_price(ref), lev, "%.2f" % tied_c)) if lev > 1 else _price(ref)
     limits = []
-    max_loss = _f(c.get("max_loss_per_trade_usd"))
+    pct = _f(c.get("max_loss_per_trade_pct"))
+    if pct:
+        if not 0 < pct <= 100:
+            raise SizeError("max_loss_per_trade_pct must be above 0 and at most 100")
+        max_loss = round(budget_acct * pct / 100.0 * fx, 2)
+        max_loss_how = "%g%% of the budget = %s" % (pct, money(max_loss))
+    else:
+        max_loss = _f(c.get("max_loss_per_trade_usd"))
+        if max_loss:
+            max_loss = round(max_loss * fx, 2)            # the config amount is in the account currency
+        max_loss_how = "%s max loss" % money(max_loss or 0)
     if max_loss:
-        limits.append({"name": "max loss", "usd": max_loss, "per": risk, "shares": shares_for(max_loss, risk),
-                       "how": "%s max loss / %s risk a share" % (money(max_loss), _price(risk))})
+        limits.append({"name": "max loss", "usd": max_loss, "per": risk, "shares": shares_for(max_loss, risk, step),
+                       "how": "%s / %s risk a share" % (max_loss_how, _price(risk))})
     cap_pct = _f(c.get("max_position_pct"))
     if cap_pct:
         cap = round(budget * cap_pct / 100.0, 2)
-        limits.append({"name": "position cap", "usd": cap, "per": ref, "shares": shares_for(cap, ref),
-                       "how": "%s%% of %s = %s / %s" % (_num(cap_pct), money(budget), money(cap), _price(ref))})
+        limits.append({"name": "position cap", "usd": cap, "per": tied_c, "shares": shares_for(cap, tied_c, step),
+                       "how": "%s%% of %s = %s / %s" % (_num(cap_pct), money(budget), money(cap), per_how)})
     max_order = _f(c.get("max_order_usd"))
     if max_order:
-        limits.append({"name": "max order", "usd": max_order, "per": ref, "shares": shares_for(max_order, ref),
-                       "how": "%s / %s" % (money(max_order), _price(ref))})
-    limits.append({"name": "cash", "usd": available, "per": ref, "shares": shares_for(available, ref),
-                   "how": "%s = %s / %s" % (cash_note, money(available), _price(ref))})
+        max_order = round(max_order * fx, 2)
+        limits.append({"name": "max order", "usd": max_order, "per": tied_c,
+                       "shares": shares_for(max_order, tied_c, step),
+                       "how": "%s / %s" % (money(max_order), per_how)})
+    limits.append({"name": "cash", "usd": available, "per": tied_c, "shares": shares_for(available, tied_c, step),
+                   "how": "%s = %s / %s" % (cash_note, money(available), per_how)})
 
     qty = max(0, min(l["shares"] for l in limits))
     bound = [l["name"] for l in limits if l["shares"] == qty]
     for l in limits:
         l["binds"] = l["name"] == bound[0]
     cost = round(qty * ref, 2)
+    margin = round(cost / lev, 2)
     loss = round(qty * risk_c / 100.0, 2)
+    min_qty = _f(c.get("min_qty")) or step
     refusal = None
-    if qty == 0:
+    unit = "share" if step == 1 else "unit"
+    if qty < min_qty - EPS:
         if bound[0] == "max loss":
-            refusal = ("one share risks %s (entry %s minus stop %s), more than your %s max loss per trade. "
+            refusal = ("%s %s risks %s (%s), more than your %s max loss per trade. "
                        "No order. Skip this trade, or plan a closer stop with trader-exit."
-                       % (money(risk), _price(ref), _price(stop), money(max_loss)))
+                       % ("one" if min_qty == 1 else qty_text(min_qty, step), unit if min_qty == 1 else unit + "s",
+                          money(risk * min_qty),
+                          ("stop %s minus entry %s" % (_price(stop), _price(ref))) if short_side
+                          else ("entry %s minus stop %s" % (_price(ref), _price(stop))),
+                          money(max_loss)))
         else:
             refusal = ("one share of %s costs %s, more than your %s limit (%s). No order."
                        % (sym, money(ref), bound[0], limits[[l["name"] for l in limits].index(bound[0])]["how"]))
@@ -399,11 +485,12 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         refusal = ("reward:risk %.2f (target %s, entry %s, stop %s) is under your minimum %s, so trader-risk "
                    "would block it. No order. Skip it, or make a new plan with trader-exit."
                    % (reward_c / float(risk_c), _price(target), _price(ref), _price(stop), _num(c["min_reward_risk"])))
-    elif cost < float(c.get("min_order_usd") or 0) - 0.005:
-        refusal = ("%d share%s of %s is %s, under your %s minimum order. No order."
-                   % (qty, "" if qty == 1 else "s", sym, money(cost), money(c["min_order_usd"])))
+    elif cost < float(c.get("min_order_usd") or 0) * fx - 0.005:
+        refusal = ("%s %s%s of %s is %s, under your %s minimum order. No order."
+                   % (qty_text(qty, step), unit, "" if qty == 1 else "s", sym, money(cost),
+                      money(float(c["min_order_usd"]) * fx)))
     return {
-        "symbol": sym, "side": "buy", "setup": plan.get("setup", ""), "date": plan.get("date"),
+        "symbol": sym, "side": side, "setup": plan.get("setup", ""), "date": plan.get("date"),
         "entry_time": plan.get("entry_time", ""), "entry_plan": round_cent(entry_plan),
         "entry": ref, "entry_from": ref_from, "stop": stop, "target": target,
         "risk_per_share": risk, "reward_risk": round(reward_c / float(risk_c), 2),
@@ -412,6 +499,8 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         "max_loss_per_trade_usd": max_loss, "limits": limits, "qty": qty, "bound_by": bound[0],
         "cost": cost, "max_loss": loss, "flat_by": plan.get("flat_by") or c.get("flat_by"),
         "order_type": "limit" if limit is not None else "market", "refusal": refusal,
+        "leverage": lev, "margin": margin, "fx_rate": fx, "budget_account": budget_acct, "qty_step": step,
+        "market": plan.get("market") or "stock", "session": plan.get("session"),
     }
 
 
@@ -419,16 +508,19 @@ def bracket_order(s):
     """The one proposed order, Alpaca place_stock_order fields (strings) plus why and plan."""
     if s["refusal"] or s["qty"] <= 0:
         return None
-    o = {"symbol": s["symbol"], "side": "buy", "qty": str(int(s["qty"])), "type": s["order_type"],
-         "time_in_force": "day"}
+    o = {"symbol": s["symbol"], "side": s["side"], "qty": qty_text(s["qty"], s.get("qty_step", 1)),
+         "type": s["order_type"], "time_in_force": "day"}
     if s["order_type"] == "limit":
         o["limit_price"] = _price(s["entry"])
     setup = SETUP_WORDS.get(s["setup"], s["setup"] or "day trade")
-    why = ("%s on %s: %d shares, bound by your %s (%d x %s = %s at the stop)"
-           % (setup, s["symbol"], s["qty"], {"max loss": "%s max loss per trade" % money(s["max_loss_per_trade_usd"] or 0),
-                                             "position cap": "position cap", "max order": "max order",
-                                             "cash": "cash after the buffer"}[s["bound_by"]],
-              s["qty"], _price(s["risk_per_share"]), money(s["max_loss"])))
+    qs = qty_text(s["qty"], s.get("qty_step", 1))
+    why = ("%s%s on %s: %s %s, bound by your %s (%s x %s = %s at the stop)"
+           % ("short " if s["side"] == "sell" else "", setup, s["symbol"], qs,
+              "shares" if s.get("qty_step", 1) == 1 else "units",
+              {"max loss": "%s max loss per trade" % money(s["max_loss_per_trade_usd"] or 0),
+               "position cap": "position cap", "max order": "max order",
+               "cash": "cash after the buffer" if s.get("leverage", 1) == 1 else "margin after the buffer"}[s["bound_by"]],
+              qs, _price(s["risk_per_share"]), money(s["max_loss"])))
     o.update({
         "order_class": "bracket",
         "take_profit_limit_price": _price(s["target"]),
@@ -438,44 +530,70 @@ def bracket_order(s):
                  "risk_per_share": s["risk_per_share"], "max_loss": s["max_loss"], "setup": s["setup"],
                  "entry_time": s["entry_time"], "flat_by": s["flat_by"]},
     })
+    if s.get("market") == "24h" or s.get("leverage", 1) != 1 or s.get("fx_rate", 1) != 1:
+        o["plan"].update({"market": s.get("market") or "stock", "session": s.get("session"),
+                          "leverage": s.get("leverage", 1), "fx_rate": s.get("fx_rate", 1),
+                          "notional": s["cost"], "margin": s.get("margin")})
     return o
 
 
 def plan_report(s, order, notes=()):
     lines = []
     setup = SETUP_WORDS.get(s["setup"], s["setup"] or "setup")
-    lines.append("%s buy, %s, entry %s%s" % (s["symbol"], setup, _price(s["entry_plan"]),
-                                            (" at " + s["entry_time"]) if s["entry_time"] else ""))
+    lines.append("%s %s, %s, entry %s%s" % (s["symbol"], "short" if s["side"] == "sell" else "buy", setup,
+                                             _price(s["entry_plan"]),
+                                             (" at " + s["entry_time"]) if s["entry_time"] else ""))
     lines.append("Stop %s%s. Target %s%s." % (_price(s["stop"]), (": " + s["stop_label"]) if s["stop_label"] else "",
                                              _price(s["target"]),
                                              (": " + s["target_label"]) if s["target_label"] else ""))
     for n in notes:
         lines.append(n)
-    src = {"plan": "the plan's entry", "price": "the latest price, above the plan's entry",
+    short_side = s["side"] == "sell"
+    step = s.get("qty_step", 1)
+    unit = "share" if step == 1 else "unit"
+    src = {"plan": "the plan's entry",
+           "price": "the latest price, %s the plan's entry" % ("under" if short_side else "above"),
            "limit": "your limit price"}[s["entry_from"]]
-    lines.append("Sized at %s (%s). Risk %s a share (entry %s minus stop %s). Reward:risk %.2f."
-                 % (_price(s["entry"]), src, _price(s["risk_per_share"]), _price(s["entry"]), _price(s["stop"]),
+    lines.append("Sized at %s (%s). Risk %s a %s (%s). Reward:risk %.2f."
+                 % (_price(s["entry"]), src, _price(s["risk_per_share"]), unit,
+                    ("stop %s minus entry %s" % (_price(s["stop"]), _price(s["entry"]))) if short_side
+                    else ("entry %s minus stop %s" % (_price(s["entry"]), _price(s["stop"]))),
                     s["reward_risk"]))
+    if s.get("fx_rate", 1) != 1:
+        lines.append("Budget %s in your account currency = %s at %g." % (
+            _num(s["budget_account"]), money(s["budget"]), s["fx_rate"]))
+    if s.get("leverage", 1) != 1:
+        lines.append("Leverage 1:%g: the caps and the cash limit count the margin a unit ties up "
+                     "(price / leverage), not its whole price. trader-risk blocks leverage unless the config "
+                     "says \"allow_margin\": true." % s["leverage"])
     lines.append("")
-    lines.append("Limits (whole shares; the smallest one wins):")
+    lines.append("Limits (%s; the smallest one wins):" % ("whole shares" if step == 1 else "units of %g" % step))
     for l in s["limits"]:
-        lines.append("  %-13s %-58s %3d shares%s" % (l["name"], l["how"], l["shares"],
-                                                      "  <- binds" if l["binds"] else ""))
+        lines.append("  %-13s %-58s %3s %ss%s" % (l["name"], l["how"], qty_text(l["shares"], step), unit,
+                                                    "  <- binds" if l["binds"] else ""))
     lines.append("")
     if order is None:
         lines.append("No order: " + s["refusal"])
         lines.append("Education and tooling, not financial advice.")
         return "\n".join(lines)
-    lines.append("Size: %d shares of %s = %s at %s. Max loss at the stop: %d x %s = %s."
-                 % (s["qty"], s["symbol"], money(s["cost"]), _price(s["entry"]), s["qty"],
+    qs = qty_text(s["qty"], step)
+    lines.append("Size: %s %s%s of %s = %s at %s. Max loss at the stop: %s x %s = %s."
+                 % (qs, unit, "" if qs == "1" else "s", s["symbol"], money(s["cost"]), _price(s["entry"]), qs,
                     _price(s["risk_per_share"]), money(s["max_loss"])))
-    lines.append("A stop is an order, not a promise: in a fast market it can fill below %s." % _price(s["stop"]))
+    if s.get("leverage", 1) != 1:
+        lines.append("It ties up %s of margin (%s notional at 1:%g)." % (money(s["margin"]), money(s["cost"]),
+                                                                          s["leverage"]))
+    lines.append("A stop is an order, not a promise: in a fast market it can fill %s %s."
+                 % ("above" if short_side else "below", _price(s["stop"])))
     lines.append("")
     lines.append("Proposed bracket order (place_stock_order arguments, nothing has been placed):")
     how = "limit %s" % order["limit_price"] if order["type"] == "limit" else "market"
-    lines.append("  buy %s %s, %s, day, take-profit %s, stop-loss %s"
-                 % (order["qty"], order["symbol"], how, order["take_profit_limit_price"],
-                    order["stop_loss_stop_price"]))
+    lines.append("  %s %s %s, %s, day, take-profit %s, stop-loss %s"
+                 % ("sell short" if short_side else "buy", order["qty"], order["symbol"], how,
+                    order["take_profit_limit_price"], order["stop_loss_stop_price"]))
+    if s.get("market") == "24h":
+        lines.append("This is a 24h market: Alpaca's place_stock_order does not trade it. Use the numbers as a "
+                     "ticket at your own broker (a futures or CFD demo account).")
     if s["flat_by"]:
         lines.append("Flat by %s New York: anything still open then gets closed (trader-alerts rings, "
                      "trader-broker flatten)." % s["flat_by"])
@@ -792,9 +910,12 @@ def run_plan(a, cfg):
         p, t, fresh = fresh_price(pdoc, sym, now)
         if p is not None and fresh:
             price = p
-            if round_cent(p) > round_cent(_f(plan.get("entry")) or 0):
-                notes.append("%s last %s (as of %s New York) is above the plan's entry %s, so the risk "
+            sell = str(plan.get("side") or "buy").lower() in ("sell", "short")
+            plan_entry = round_cent(_f(plan.get("entry")) or 0)
+            if (round_cent(p) < plan_entry) if sell else (round_cent(p) > plan_entry):
+                notes.append("%s last %s (as of %s New York) is %s the plan's entry %s, so the risk "
                              "is bigger: sized at %s." % (sym, _price(p), to_eastern(t).strftime("%H:%M"),
+                                                          "under" if sell else "above",
                                                           _price(plan.get("entry")), _price(p)))
         elif p is not None:
             notes.append("%s in %s is %s: not used (older than %d minutes). Sized at the plan's entry."

@@ -35,6 +35,14 @@ daily     Pre-market scan of daily CLOSES (Yahoo spark: 20 symbols a request,
             reclaim_ma20     closed under the 20-day average, then closed above it
             oversold         RSI 14 (Wilder) under 30
             oversold_bounce  RSI 14 was under 30 yesterday and today closed up
+          --side short looks for the mirror images instead (a short is a bet on a fall):
+            breakdown_20d        the last close is below every close of the 20 before it
+            bear_flag            down more than 10 % over the 10 sessions before the
+                                 last 5, then the last 5 closes inside a 5 % range
+            lost_ma20            closed over the 20-day average, then closed under it
+            overbought           RSI 14 (Wilder) over 70
+            overbought_reversal  RSI 14 was over 70 yesterday and today closed down
+          The watchlist then carries "side": "sell"; use it with entry.py --side sell.
           Today's daily bar is dropped until the session's close.
 
 orb       Opening-range breakouts, 5-minute bars. The range is the first
@@ -125,6 +133,13 @@ OPEN = datetime.time(9, 30)
 CLOSE = datetime.time(16, 0)
 EARLY = datetime.time(13, 0)
 
+SETUPS_SHORT = [
+    ("breakdown_20d", "20-day closing-low breakdown"),
+    ("bear_flag", "bear flag"),
+    ("lost_ma20", "lost the 20-day average"),
+    ("overbought", "overbought (RSI over 70)"),
+    ("overbought_reversal", "overbought reversal"),
+]
 SETUPS = [
     ("breakout_20d", "20-day closing-high breakout"),
     ("bull_flag", "bull flag"),
@@ -132,7 +147,7 @@ SETUPS = [
     ("oversold", "oversold (RSI under 30)"),
     ("oversold_bounce", "oversold bounce"),
 ]
-LABEL = dict(SETUPS)
+LABEL = dict(SETUPS + SETUPS_SHORT)
 
 
 class ScanError(Exception):
@@ -513,11 +528,13 @@ def daily_closes(series, now_utc):
     return sorted(out.items())
 
 
-def find_setups(closes):
-    """closes (oldest first, >= 30) -> (setup keys, numbers)."""
+def find_setups(closes, side="buy"):
+    """closes (oldest first, >= 30) -> (setup keys, numbers). side "sell" looks for the
+    mirror images: setups for a short."""
     c = closes
     last = c[-1]
     hi20 = max(c[-21:-1])
+    lo20 = min(c[-21:-1])
     ma20 = sum(c[-20:]) / 20.0
     ma20_prev = sum(c[-21:-1]) / 20.0
     run = c[-6] / c[-16] - 1
@@ -525,21 +542,33 @@ def find_setups(closes):
     r = rsi(c)
     r_prev = rsi(c[:-1])
     tags = []
-    if last > hi20:
-        tags.append("breakout_20d")
-    if run > 0.10 and rng5 < 0.05:
-        tags.append("bull_flag")
-    if c[-2] < ma20_prev and last > ma20:
-        tags.append("reclaim_ma20")
-    if r is not None and r < 30:
-        tags.append("oversold")
-    if r_prev is not None and r_prev < 30 and last > c[-2]:
-        tags.append("oversold_bounce")
-    return tags, {"rsi": r, "rsi_prev": r_prev, "high20": hi20, "ma20": ma20,
+    if side == "sell":
+        if last < lo20:
+            tags.append("breakdown_20d")
+        if run < -0.10 and rng5 < 0.05:
+            tags.append("bear_flag")
+        if c[-2] > ma20_prev and last < ma20:
+            tags.append("lost_ma20")
+        if r is not None and r > 70:
+            tags.append("overbought")
+        if r_prev is not None and r_prev > 70 and last < c[-2]:
+            tags.append("overbought_reversal")
+    else:
+        if last > hi20:
+            tags.append("breakout_20d")
+        if run > 0.10 and rng5 < 0.05:
+            tags.append("bull_flag")
+        if c[-2] < ma20_prev and last > ma20:
+            tags.append("reclaim_ma20")
+        if r is not None and r < 30:
+            tags.append("oversold")
+        if r_prev is not None and r_prev < 30 and last > c[-2]:
+            tags.append("oversold_bounce")
+    return tags, {"rsi": r, "rsi_prev": r_prev, "high20": hi20, "low20": lo20, "ma20": ma20,
                   "run_pct": run * 100, "range5_pct": rng5 * 100}
 
 
-def scan_daily(data, symbols, now_utc, min_price, min_volume):
+def scan_daily(data, symbols, now_utc, min_price, min_volume, side="buy"):
     """Pure. data = {SYM: series}. Returns (hits, counts, last_date)."""
     hits, dates = [], {}
     counts = {"requested": len(symbols), "fetched": 0, "illiquid": 0, "short": 0, "scanned": 0}
@@ -564,7 +593,7 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume):
         d_last = bars[-1][0]
         dates[d_last] = dates.get(d_last, 0) + 1
         closes = [c for _, c in bars]
-        tags, nums = find_setups(closes)
+        tags, nums = find_setups(closes, side)
         if tags:
             hits.append({"symbol": sym, "setups": tags, "price": round(closes[-1], 2),
                          "close_date": d_last.isoformat(), "rsi": round(nums["rsi"], 1),
@@ -619,15 +648,20 @@ def usable(bars, day, cutoff, n_range):
     return all(b["start"] == slot(day, k) for k, b in enumerate(bars))
 
 
-def orb_candidate(bars, n_range):
+def orb_candidate(bars, n_range, side="buy"):
     """Stage 1, closes only: some completed bar after the range closed at or above
-    the highest close of the range. Necessary for a breakout (range high >= any range close)."""
+    the highest close of the range (a short: at or below the lowest close). Necessary for a
+    breakout (range high >= any range close; range low <= any range close)."""
+    if side == "sell":
+        bottom = min(b["c"] for b in bars[:n_range])
+        return any(b["c"] <= bottom for b in bars[n_range:])
     top = max(b["c"] for b in bars[:n_range])
     return any(b["c"] >= top for b in bars[n_range:])
 
 
-def orb_hit(bars, n_range):
-    """Stage 2, real highs and lows: the first completed bar to CLOSE above the range high."""
+def orb_hit(bars, n_range, side="buy"):
+    """Stage 2, real highs and lows: the first completed bar to CLOSE above the range high
+    (a short: below the range low)."""
     rng = bars[:n_range]
     if any(b["h"] is None or b["l"] is None for b in rng):
         return None
@@ -635,12 +669,13 @@ def orb_hit(bars, n_range):
     ol = min(b["l"] for b in rng)
     for k in range(n_range, len(bars)):
         b = bars[k]
-        if b["c"] > oh:
+        if (b["c"] < ol) if side == "sell" else (b["c"] > oh):
             closes_at = b["start"] + datetime.timedelta(minutes=BAR_MIN)
             return {"price": round(b["c"], 2), "at": clock_label(closes_at),
                     "bar_start": b["start"].strftime("%H:%M"), "bar_index": k,
                     "or_high": round(oh, 2), "or_low": round(ol, 2),
-                    "pct_over": round((b["c"] / oh - 1) * 100, 2), "_t": closes_at}
+                    "pct_over": round(((1 - b["c"] / ol) if side == "sell" else (b["c"] / oh - 1)) * 100, 2),
+                    "_t": closes_at}
     return None
 
 
@@ -684,7 +719,7 @@ def orb_window(now_utc, at, or_minutes, until, explicit_day=None):
 
 
 def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume=0, confirm=None,
-             max_confirm=None):
+             max_confirm=None, side="buy"):
     """stage1 = {SYM: series} with closes (spark or v8). confirm(sym) -> series with highs/lows
     (None = use the stage-1 series). With confirm and max_confirm, only the max_confirm most
     traded candidates (price x volume so far) are confirmed; the rest are counted as unconfirmed.
@@ -707,7 +742,7 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume
             counts["illiquid"] += 1
             continue
         counts["scanned"] += 1
-        if orb_candidate(bars, n_range):
+        if orb_candidate(bars, n_range, side):
             cands.append((sym, bars, bars[-1]["c"] * vol))
     counts["candidates"] = len(cands)
     if confirm is not None and max_confirm and len(cands) > max_confirm:
@@ -727,7 +762,7 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume
                 failed[sym] = "the v8 chart has a missing bar"
                 continue
         counts["confirmed"] += 1
-        h = orb_hit(full, n_range)
+        h = orb_hit(full, n_range, side)
         if h:
             hits.append(dict({"symbol": sym, "setups": ["orb"]}, **h))
     hits.sort(key=lambda x: (x["_t"], x["symbol"]))
@@ -831,6 +866,15 @@ def write_json(path, doc):
         fh.write("\n")
 
 
+def side_of(text):
+    t = str(text or "buy").lower()
+    if t in ("buy", "long"):
+        return "buy"
+    if t in ("sell", "short"):
+        return "sell"
+    raise ScanError("--side is buy or sell (short)")
+
+
 def money(x):
     return "${:,.2f}".format(x)
 
@@ -892,13 +936,16 @@ def cmd_daily(a):
         progress(a, "Fetching daily closes for %s symbols (%d spark requests)..."
                  % ("{:,}".format(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
         data, failed = fetch_spark(symbols, "3mo", "1d", a.pause, a)
-    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume)
+    side = side_of(a.side)
+    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume, side)
     nfailed = len(symbols) - counts["fetched"]
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
            "source": "yahoo", "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
            "note": NOTE, "hits": hits}
+    if side == "sell":
+        doc["side"] = "sell"
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     if not a.no_write:
@@ -917,10 +964,10 @@ def cmd_daily(a):
                            (", %d had under %d days" % (counts["short"], MIN_DAILY_BARS)) if counts["short"] else "",
                            "{:,}".format(counts["scanned"])))
     if hits:
-        per = [(k, sum(1 for h in hits if k in h["setups"])) for k, _ in SETUPS]
+        per = [(k, sum(1 for h in hits if k in h["setups"])) for k, _ in (SETUPS_SHORT if side == "sell" else SETUPS)]
         print("%d chart%s matched a setup: %s." % (len(hits), "" if len(hits) == 1 else "s",
                                                   ", ".join("%d %s" % (n, LABEL[k]) for k, n in per if n)))
-        print("Most traded first (price x volume):")
+        print("Most traded first (price x volume)%s:" % (" - setups for a short" if side == "sell" else ""))
     else:
         print("No setups.")
     for h in hits[:a.show]:
@@ -930,7 +977,8 @@ def cmd_daily(a):
         print("  ... and %d more in the watchlist (--show N for more)." % (len(hits) - a.show))
     if not a.no_write:
         print("Wrote %s (mode daily, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
-    print(NOTE + " Next: pick one chart, then /trader-news TICKER.")
+    print(NOTE + " Next: pick one chart, then /trader-news TICKER%s." % (
+        " and entry.py --side sell" if side == "sell" else ""))
     return 0 if hits else 1
 
 
@@ -977,8 +1025,9 @@ def cmd_orb(a):
             if len(done) % 50 == 0:
                 progress(a, "  stage 2: %d v8 charts so far" % len(done))
             return parse_chart(yahoo_get(chart_path(sym, rng, "%dm" % BAR_MIN)), sym)
+    side = side_of(a.side)
     hits, counts, failed2 = scan_orb(data, symbols, day, cutoff, a.or_minutes, a.min_price, a.min_volume, confirm,
-                                     a.max_confirm)
+                                     a.max_confirm, side)
     failed = dict(failed or {})
     failed.update(failed2)
     nfailed = len([s for s in symbols if s in failed])
@@ -988,6 +1037,8 @@ def cmd_orb(a):
            "unconfirmed": counts["unconfirmed"], "source": "yahoo", "or_minutes": a.or_minutes,
            "interval": "%dm" % BAR_MIN,
            "filters": {"min_price": a.min_price, "min_volume": a.min_volume}, "note": NOTE, "hits": hits}
+    if side == "sell":
+        doc["side"] = "sell"
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     if not a.no_write:
@@ -995,8 +1046,8 @@ def cmd_orb(a):
     if a.json:
         print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2))
         return 0 if hits else 1
-    print("Opening-range breakout scan, %s %s ET: %d-minute range (9:30 to %s), 5-minute bars, Yahoo."
-          % (day_label(day), clock_label(cutoff), a.or_minutes, clock_label(slot(day, a.or_minutes // BAR_MIN))))
+    print("Opening-range %s scan, %s %s ET: %d-minute range (9:30 to %s), 5-minute bars, Yahoo."
+          % ("breakdown" if side == "sell" else "breakout", day_label(day), clock_label(cutoff), a.or_minutes, clock_label(slot(day, a.or_minutes // BAR_MIN))))
     print("Fetched %s of %s charts%s; %s usable%s; %s candidates, %s confirmed with real highs and lows."
           % ("{:,}".format(counts["fetched"]), "{:,}".format(len(symbols)),
              (" (%s failed or had no data)" % "{:,}".format(nfailed)) if nfailed else "",
@@ -1007,19 +1058,23 @@ def cmd_orb(a):
         print("PARTIAL: %s more candidates were not checked (only the %s most traded are; --max-confirm 0 "
               "checks all)." % ("{:,}".format(counts["unconfirmed"]), "{:,}".format(a.max_confirm)))
     if hits:
-        print("%d of %s charts closed above their opening-range high by %s:"
+        print("%d of %s charts closed %s their opening-range %s by %s:"
               % (len(hits), ("the %s checked" % "{:,}".format(counts["confirmed"])) if counts["unconfirmed"]
-                 else "{:,}".format(counts["scanned"]), clock_label(cutoff)))
+                 else "{:,}".format(counts["scanned"]), "below" if side == "sell" else "above",
+                 "low" if side == "sell" else "high", clock_label(cutoff)))
         for h in hits[:a.show]:
-            print("  %8s  %-6s %10s  range %s to %s  %+.2f%% over" % (
-                h["at"], h["symbol"], money(h["price"]), _p(h["or_low"]), _p(h["or_high"]), h["pct_over"]))
+            print("  %8s  %-6s %10s  range %s to %s  %+.2f%% %s" % (
+                h["at"], h["symbol"], money(h["price"]), _p(h["or_low"]), _p(h["or_high"]), h["pct_over"],
+                "under" if side == "sell" else "over"))
         if len(hits) > a.show:
             print("  ... and %d more in the watchlist (--show N for more)." % (len(hits) - a.show))
     else:
-        print("No chart closed above its opening-range high by %s." % clock_label(cutoff))
+        print("No chart closed %s its opening-range %s by %s." % (
+            "below" if side == "sell" else "above", "low" if side == "sell" else "high", clock_label(cutoff)))
     if not a.no_write:
         print("Wrote %s (mode orb, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
-    print(NOTE + " Next: pick one chart, then /trader-news TICKER and /trader-entry TICKER.")
+    print(NOTE + " Next: pick one chart, then /trader-news TICKER and /trader-entry TICKER%s." % (
+        " (entry.py --side sell)" if side == "sell" else ""))
     return 0 if hits else 1
 
 
@@ -1051,6 +1106,8 @@ def main(argv=None):
         p.add_argument("--out", default="trader/watchlist.json")
         p.add_argument("--no-write", action="store_true")
         p.add_argument("--pause", type=float, default=PAUSE, help="seconds between requests (%.1f)" % PAUSE)
+        p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"],
+                       help="buy/long (default) or sell/short: setups for a fall instead of a rise")
         p.add_argument("--show", type=int, default=50, help="hits to print (all are written)")
         p.add_argument("--quiet", action="store_true")
         p.add_argument("--json", action="store_true")

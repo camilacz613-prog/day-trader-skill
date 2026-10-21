@@ -152,6 +152,25 @@ for the 60 days to October 19 2026, the 10:15 AM opening-range scan, Yahoo's
 TSLA headlines that morning, the House Clerk's 2026 index, real PTR text and
 real XBRL facts. They reproduce every number in the example above.
 
+## Shorts and 24h markets
+
+Beyond the long-only stock day trade, the entry-to-ticket chain also handles two extras. Both are off
+until you turn them on in `trader/config.json`.
+
+- **Short side.** `--side sell` (or `short`) on the scanner, entry timer, exit planner and Time Machine
+  mirrors every rule: a close below the range low, a stop above the entry, a target below it, sizing from
+  the distance up to the stop, and a buy to cover at the end. It needs `"allow_short": true`. A short has
+  no ceiling on its loss.
+- **24h markets.** `--market 24h --anchor 08:20 --close 17:00` (New York time) runs the same chain on
+  gold futures (`GC=F`), forex (`EURUSD=X`) or crypto (`BTC-USD`), on a session you name instead of the
+  stock market's 9:30 to 16:00. It needs `"allow_24h": true`. Alpaca's order tool does not trade these:
+  the ticket is a manual one for your own broker's demo account. `trader-budget` can size in units of
+  0.01 with a `leverage`, an account currency (`fx_rate`) and a max loss as a percent of the budget
+  (`config.gold-demo.example.json`); leverage needs `"allow_margin": true`.
+
+The opening-range idea comes from the stock market's open. A 24h market has no such moment, so you pick
+the anchor, and the Time Machine's history replay tells you whether the rule worked on that symbol.
+
 ## Fine print
 
 **Not financial advice.** This is software that reads public data and does
@@ -164,7 +183,7 @@ an order, and only after `/trader-risk` passes that exact order and you type
 yes for it in the chat. Set your brokerage tool to "Needs approval" in Claude
 (Customize, Connectors, tool permissions), never "Always allow", so Claude's
 own "Allow once / Deny" card is a second check. No options, margin, short
-selling or leverage unless you turn them on.
+selling, 24h markets or leverage unless you turn them on.
 
 **Paper first.** `"paper": true` is the default in `config.example.json`, and
 Alpaca's MCP server defaults to its paper account. Keys live in environment
@@ -205,7 +224,7 @@ trader-entry/       SKILL.md, entry.py
 trader-exit/        SKILL.md, exit.py
 trader-timemachine/ SKILL.md, timemachine.py
 trader-risk/        SKILL.md, check.py
-trader-budget/      SKILL.md, size.py, config.example.json, targets.example.json
+trader-budget/      SKILL.md, size.py, config.example.json, config.gold-demo.example.json, targets.example.json
 trader-broker/      SKILL.md, ticket.py, claude_desktop_config.example.json
 trader-alerts/      SKILL.md, alerts.py, alerts.example.json
 trader-analyst/     SKILL.md, facts.py, metrics.example.json

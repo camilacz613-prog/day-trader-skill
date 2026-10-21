@@ -6,8 +6,10 @@ description: >-
   bracket shows its stop-loss, take-profit and the max loss at the stop)
   plus the exact JSON for Alpaca's place_stock_order, records your yes word
   for word, then Claude's own Allow once / Deny card asks again. Builds the
-  sell ticket that closes a day trade by your flat-by time, records fills,
-  and logs each trade's max loss so trader-risk can hold the daily limit.
+  ticket that closes a day trade by your flat-by time (a sell for a long, a
+  buy to cover for a short), records fills, and logs each trade's max loss so
+  trader-risk can hold the daily limit. A 24h-market order (gold futures,
+  forex, crypto) becomes a manual ticket for your own broker, not an Alpaca call.
   Covers setting up Alpaca's official MCP server in Claude Desktop (paper by
   default, keys in env vars, never in chat), the Interactive Brokers
   connector, and setting order tools to "Needs approval". Use when the user
@@ -190,6 +192,20 @@ The user replies "yes". Claude records it, calls `place_stock_order`, and the
 card reads "Claude wants to use Place stock order" with that JSON and two
 buttons: Allow once, Deny. Allow once sends it to the paper account. The
 `why` and the plan stay in the file; they are never sent.
+
+## Short side and 24h markets
+
+- **Short.** A bracket sell whose stop is above its entry reads `SELL SHORT` and counts as an entry for
+  trader-risk. With `"allow_short": true`, its fill makes a negative position in `trader/portfolio.json`, and a
+  buy that closes it covers it (`ticket.py flatten` builds the buy to cover; `--side` overrides). Shorting
+  needs a margin account at the broker. A short has no ceiling: say so.
+- **24h markets and `"broker": "manual"`.** An order whose plan says `"market": "24h"`, or a config that says
+  `"broker": "manual"`, is NOT sent through `place_stock_order`. The ticket says so and prints the numbers to
+  enter at your own broker (a demo account first): side, quantity, stop-loss, take-profit, leverage, margin and
+  flat-by time. Your yes is recorded the same way, `result --status placed` records that you placed it, and
+  the fill is logged for the day's counts but NOT added to `trader/portfolio.json` (leveraged positions and a
+  second currency do not fit its cash-and-shares accounting). Claude never places it and the Allow once card
+  does not apply.
 
 ## What it never does
 

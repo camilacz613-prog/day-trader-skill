@@ -31,6 +31,16 @@ are for the plan's day only). An above / below alert rings ONCE and then stays
 quiet until you reset it, unless the rule has "rearm": true (it re-arms when
 the price crosses back). A pct_move alert rings at most once per day.
 
+Short side. A stop or target rule with "side": "sell" (a short) is mirrored: the stop rings when
+the price is at or ABOVE it, the target when it is at or below. `add --from-plan` sets this from
+a plan with "side": "sell"; `add --stop 370.04 --side sell` does it by hand.
+
+24h markets. A rule from a plan with "market": "24h" carries the plan's "session" (open and
+close, New York time) and is watched for that session only, even when it runs past midnight.
+Its flat-by time rings when the New York clock passes it inside the session, without any NYSE
+calendar. `clock --market 24h --anchor 08:20 --close 17:00` shows whether such a session is
+open. Quotes work for any Yahoo symbol such as GC=F, EURUSD=X or BTC-USD.
+
 Quotes (free, delayed, unofficial; for alerts only, never for timing an order):
   yahoo   https://query2.finance.yahoo.com/v8/finance/chart/TSLA (falls back to
           query1 on a 429 or a 5xx; one retry with a pause on a 429; one
@@ -186,6 +196,66 @@ def market_status(now_utc):
     for _ in range(15):
         if session(nd):
             st["next_open"] = "%s 09:30" % nd.isoformat()
+            break
+        nd += datetime.timedelta(days=1)
+    return st
+
+
+def _in_market_week(t):
+    """Futures and forex: Sunday 18:00 to Friday 17:00 New York time."""
+    wd = t.weekday()
+    if wd == 5:
+        return False
+    if wd == 6 and t.time() < datetime.time(18, 0):
+        return False
+    if wd == 4 and t.time() > datetime.time(17, 0):
+        return False
+    return True
+
+
+def _wall_after(open_dt, t):
+    """The first moment at or after open_dt whose wall-clock time is t."""
+    at = datetime.datetime.combine(open_dt.date(), t)
+    return at if at >= open_dt else at + datetime.timedelta(days=1)
+
+
+def window24(day, open_t, close_t):
+    """(open_dt, close_dt) of the 24h session that starts on `day`; a close at or before the open
+    means the next morning."""
+    o, c = datetime.datetime.combine(day, open_t), datetime.datetime.combine(day, close_t)
+    if c <= o:
+        c += datetime.timedelta(days=1)
+    return o, c
+
+
+def market_status24(now_utc, anchor="08:20", close="17:00", weekends=False):
+    """Like market_status, for a 24h session you name (New York time)."""
+    open_t, close_t = _hhmm(anchor), _hhmm(close)
+    if open_t is None or close_t is None:
+        raise AlertError("--anchor and --close want New York times like 08:20 and 17:00")
+    local = to_eastern(now_utc)
+    d = local.date()
+    st = {"now_new_york": local.strftime("%Y-%m-%d %H:%M"), "date": d.isoformat(), "weekday": local.strftime("%A"),
+          "calendar_known": False, "open": False, "reason": "outside the session", "early_close": None,
+          "market": "24h", "opens": open_t.strftime("%H:%M"), "closes": close_t.strftime("%H:%M")}
+
+    def valid(day):
+        o, c = window24(day, open_t, close_t)
+        return weekends or (_in_market_week(o) and _in_market_week(c - datetime.timedelta(seconds=1)))
+
+    for back in (0, 1):
+        day = d - datetime.timedelta(days=back)
+        o, c = window24(day, open_t, close_t)
+        if valid(day) and o <= local < c:
+            st.update(open=True, reason="24h session", session_date=day.isoformat())
+            return st
+    if not weekends and not _in_market_week(local):
+        st["reason"] = "weekend (futures and forex trade Sunday 18:00 to Friday 17:00 New York time)"
+    nd = d
+    for _ in range(10):
+        o, _c = window24(nd, open_t, close_t)
+        if valid(nd) and o > local:
+            st["next_open"] = o.strftime("%Y-%m-%d %H:%M")
             break
         nd += datetime.timedelta(days=1)
     return st
@@ -406,6 +476,29 @@ def active(rule, today):
     return not rule.get("date") or str(rule["date"]) == today
 
 
+def is24(rule):
+    return isinstance(rule.get("session"), dict) and rule["session"].get("kind") == "24h"
+
+
+def rule_window(rule):
+    """(open_dt, close_dt) of a 24h rule's session, or None without a date."""
+    if not is24(rule) or not rule.get("date"):
+        return None
+    o_t, c_t = _hhmm(rule["session"].get("open")), _hhmm(rule["session"].get("close"))
+    if o_t is None or c_t is None:
+        raise AlertError("rule %s: the session needs open and close like \"08:20\"" % rule.get("id"))
+    return window24(datetime.date.fromisoformat(str(rule["date"])), o_t, c_t)
+
+
+def rule_active(rule, today, local):
+    """A 24h rule is watched from an hour before its session opens to 12 hours after it closes, even
+    across midnight; any other rule by its date."""
+    w = rule_window(rule)
+    if w is None:
+        return active(rule, today)
+    return w[0] - datetime.timedelta(hours=1) <= local < w[1] + datetime.timedelta(hours=12)
+
+
 def _rang_today(stamp, today):
     """Did a rule that rang at this UTC stamp ring on this New York date?"""
     if not stamp:
@@ -436,14 +529,41 @@ def evaluate(rules, quotes, status, state, now_utc):
     for r in rules:
         validate(r)
         rid = r.get("id") or "%s-%s" % (r.get("symbol", "market"), r["type"])
-        if not active(r, today):
+        if not rule_active(r, today, local):
             continue
-        typ = {"stop": "below", "target": "above"}.get(r["type"], r["type"])
+        short = r.get("side") == "sell"
+        typ = ({"stop": "above", "target": "below"} if short else {"stop": "below", "target": "above"}).get(
+            r["type"], r["type"])
         if typ == "opening_bell":
             if status["open"] and not _rang_today(rung.get(rid), today):
                 rings.append({"id": rid, "symbol": "", "message": "Opening bell: the NYSE is open (%s New York)%s."
                               % (status["now_new_york"], (", early close at 1:00 p.m. today, "
                                                           + status["early_close"]) if status.get("early_close") else "")})
+                rung[rid] = stamp
+            continue
+        if typ == "time" and is24(r):
+            w = rule_window(r)
+            at = _hhmm(r.get("at"))
+            if w is None:
+                raise AlertError("rule %s: a 24h time alert needs a \"date\" (the session's start date)" % rid)
+            ring_dt = _wall_after(w[0], at)
+            last = rung.get(rid)
+            try:
+                already = bool(last) and to_eastern(datetime.datetime.strptime(last[:19], "%Y-%m-%dT%H:%M:%S")) >= w[0]
+            except ValueError:
+                already = bool(last)
+            if local >= ring_dt and not already:
+                label = r.get("label") or "time alert"
+                msg = "%s%s: it is %s New York (set for %s)" % (label[:1].upper(), label[1:], local.strftime("%H:%M"),
+                                                                 ring_dt.strftime("%H:%M"))
+                msg += (", the session ends at %s." % w[1].strftime("%H:%M")) if local < w[1] else \
+                    ", the session has ended."
+                sym = str(r.get("symbol") or "").upper()
+                if sym:
+                    msg += (" If %s is still open, close it: trader-broker flatten --symbol %s --qty N builds the %s "
+                            "ticket, then trader-risk and your yes (a 24h market is closed at your own broker)."
+                            % (sym, sym, "buy-to-cover" if short else "sell"))
+                rings.append({"id": rid, "symbol": sym, "message": msg})
                 rung[rid] = stamp
             continue
         if typ == "time":
@@ -456,8 +576,8 @@ def evaluate(rules, quotes, status, state, now_utc):
                     ", the market has closed."
                 sym = str(r.get("symbol") or "").upper()
                 if sym:
-                    msg += (" If %s is still open, close it: trader-broker flatten --symbol %s builds the sell "
-                            "ticket, then trader-risk and your yes." % (sym, sym))
+                    msg += (" If %s is still open, close it: trader-broker flatten --symbol %s builds the %s "
+                            "ticket, then trader-risk and your yes." % (sym, sym, "buy-to-cover" if short else "sell"))
                 rings.append({"id": rid, "symbol": sym, "message": msg})
                 rung[rid] = stamp
             continue
@@ -502,22 +622,38 @@ def rules_from_plan(plan, cfg_flat_by=None):
     if not isinstance(plan, dict) or not plan.get("symbol"):
         raise AlertError("the plan has no symbol (run trader-exit first)")
     sym = str(plan["symbol"]).upper()
+    sell = str(plan.get("side") or "buy").lower() in ("sell", "short")
+    sess = plan.get("session") if isinstance(plan.get("session"), dict) and plan["session"].get("kind") == "24h" else None
+    if sess and not plan.get("date"):
+        raise AlertError("a 24h plan needs a date (the session's start date): run trader-exit again")
     out = []
     for key, typ, word in (("stop", "stop", "plan stop"), ("target", "target", "plan target")):
         v = plan.get(key)
         if not isinstance(v, (int, float)) or v <= 0:
             raise AlertError("the plan has no %s (run trader-exit)" % key)
         label = plan.get("%s_label" % key)
-        out.append({"id": "%s-plan-%s" % (sym.lower(), key), "symbol": sym, "type": typ, "price": float(v),
-                    "note": word + (": " + label if label else "")})
-    flat = plan.get("flat_by") or cfg_flat_by or "15:55"
+        rule = {"id": "%s-plan-%s" % (sym.lower(), key), "symbol": sym, "type": typ, "price": float(v),
+                "note": word + (": " + label if label else "")}
+        if sell:
+            rule["side"] = "sell"
+        out.append(rule)
+    flat = plan.get("flat_by") or cfg_flat_by or ("16:55" if sess else "15:55")
     if _hhmm(flat) is None:
         raise AlertError("the plan's flat_by %r is not a time like 15:55" % flat)
-    out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
-                "label": "flat by close", "before_close": True})
-    if plan.get("date"):
-        for r in out:
+    flat_rule = {"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
+                 "label": "flat by close"}
+    if sell:
+        flat_rule["side"] = "sell"
+    if not sess:
+        flat_rule["before_close"] = True
+    out.append(flat_rule)
+    for r in out:
+        if plan.get("date"):
             r["date"] = str(plan["date"])
+        if sess:
+            r["market"] = "24h"
+            r["session"] = {"kind": "24h", "open": sess.get("open"), "close": sess.get("close"),
+                            "weekends": bool(sess.get("weekends"))}
     return out
 
 
@@ -543,6 +679,18 @@ def _dedupe(items):
 
 
 def cmd_clock(a):
+    if a.market == "24h":
+        st = market_status24(parse_now(a.now), a.anchor or "08:20", a.close or "17:00", a.weekends)
+        if a.json:
+            print(json.dumps(st, indent=2))
+        else:
+            print("New York %s (%s): 24h session %s to %s is %s, %s." % (
+                st["now_new_york"], st["weekday"], st["opens"], st["closes"], "OPEN" if st["open"] else "closed",
+                st["reason"]))
+            if not st["open"] and st.get("next_open"):
+                print("Next open: %s New York." % st["next_open"])
+            print("No holiday calendar for 24h markets: a holiday or a thin day is not checked.")
+        return 0 if st["open"] else 1
     st = market_status(parse_now(a.now))
     if a.json:
         print(json.dumps(st, indent=2))
@@ -592,7 +740,7 @@ def cmd_check(a):
     rules = doc["rules"]
     now = parse_now(a.now)
     status = market_status(now)
-    watched = [r for r in rules if active(r, status["date"])]
+    watched = [r for r in rules if rule_active(r, status["date"], to_eastern(now))]
     syms = _dedupe([str(r.get("symbol", "")).upper() for r in watched if r.get("type") not in NO_QUOTE])
     quotes, errors = (get_quotes(syms, a.source, a.offline) if syms else ({}, []))
     state = _read(a.state, {})
@@ -607,6 +755,8 @@ def cmd_check(a):
     else:
         print("NYSE %s (%s New York, %s)." % ("OPEN" if status["open"] else "closed", status["now_new_york"],
                                               status["reason"]))
+        if any(is24(r) for r in watched):
+            print("24h-market rules are watched by their own session, not the NYSE hours.")
         for r in rings:
             print("ALERT " + r["message"])
         if not rings:
@@ -665,8 +815,12 @@ def cmd_add(a):
             rule = {"type": "below", "price": a.below}
         elif a.stop is not None:
             rule = {"type": "stop", "price": a.stop}
+            if a.side == "sell":
+                rule["side"] = "sell"
         elif a.target is not None:
             rule = {"type": "target", "price": a.target}
+            if a.side == "sell":
+                rule["side"] = "sell"
         elif a.pct is not None:
             rule = {"type": "pct_move", "pct": a.pct}
             if a.direction:
@@ -674,6 +828,8 @@ def cmd_add(a):
         else:
             raise AlertError("give one of --above, --below, --stop, --target or --pct")
         val = rule.get("price", rule.get("pct"))
+        if a.side == "sell" and rule["type"] not in ("stop", "target"):
+            raise AlertError("--side sell is for --stop and --target (a short's stop is above, its target below)")
         rule = dict({"id": a.id or ("%s-%s-%s" % (sym.lower(), rule["type"], _n(val)))}, symbol=sym, **rule)
         if a.rearm:
             rule["rearm"] = True
@@ -725,7 +881,11 @@ def main(argv=None):
         p.add_argument("--now", help="pretend it is this time (no offset = New York time)")
         p.add_argument("--json", action="store_true")
 
-    p = sub.add_parser("clock", help="is the NYSE open?")
+    p = sub.add_parser("clock", help="is the NYSE open? (or a 24h session you name)")
+    p.add_argument("--market", default="stock", choices=["stock", "24h"])
+    p.add_argument("--anchor", help="24h: session open, New York HH:MM (default 08:20)")
+    p.add_argument("--close", help="24h: session close, New York HH:MM (default 17:00)")
+    p.add_argument("--weekends", action="store_true", help="24h: Saturday and Sunday count (crypto)")
     p.add_argument("--now")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("quote", help="latest delayed quotes")
@@ -762,6 +922,8 @@ def main(argv=None):
                    help="a time alert that moves 3 hours earlier on a 1:00 p.m. early close")
     p.add_argument("--date", help="watch this rule on this New York date only (YYYY-MM-DD)")
     p.add_argument("--direction", choices=["up", "down"])
+    p.add_argument("--side", choices=["buy", "sell"], default="buy",
+                   help="with --stop/--target: sell = a short (stop above, target below)")
     p.add_argument("--rearm", action="store_true")
     p.add_argument("--note")
     p.add_argument("--id")

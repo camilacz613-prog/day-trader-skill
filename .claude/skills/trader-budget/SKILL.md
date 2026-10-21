@@ -6,8 +6,10 @@ description: >-
   the whole shares that fit inside four limits (max loss per trade, position
   cap, max order, cash after your buffer), says which limit decided it, and
   writes ONE bracket order (entry, stop-loss, take-profit) to
-  trader/orders.json in the exact shape of Alpaca's place_stock_order. A stop
-  too far away for your max loss is a plain refusal, not a smaller order.
+  trader/orders.json in the exact shape of Alpaca's place_stock_order. Sizes a
+  short the same way, and can size in units of 0.01 with a leverage, an
+  account currency (3,000 EUR) and a max loss as a percent of the budget. A
+  stop too far away for your max loss is a plain refusal, not a smaller order.
   Nothing is placed. Use when the user says "how many shares", "size this
   trade", "how much should I buy", "I have $5,000", "I only want to risk $50
   a trade", "set my rules", "keep 10% in cash", or after /trader-exit writes
@@ -139,6 +141,29 @@ With `"fractional": false` (the example config) it buys whole shares and
 needs prices (`--prices trader/prices.json`). These are plain buys with no stop: trader-risk blocks them while
 `require_stop` is true and counts each one against `max_trades_per_day`. Use
 a separate config (`--config`) for a long-term split.
+
+## Short side, leverage, currency and unit size
+
+All optional. With none of these set, the sizing is the plain stock sizing above.
+
+| config key | default | what it does |
+| --- | --- | --- |
+| `leverage` | 1 | above 1 the position cap, max order and cash limits count the MARGIN the order ties up (notional / leverage). The max loss limit still counts the whole stop distance, so it does the real work. trader-risk blocks leverage unless `"allow_margin": true` |
+| `fx_rate` | 1 | how many units of the instrument's currency one unit of your account currency buys (3,000 EUR at EURUSD 1.1236 is $3,370.80). Your money settings are in your account currency; the sizing and the report run in the instrument's |
+| `max_loss_per_trade_pct` | none | a percent of the budget; when set it replaces `max_loss_per_trade_usd` |
+| `qty_step` | 1 | 1 = whole shares; `0.01` sizes in hundredths (a CFD, or a broker that sells fractions). The size rounds DOWN to the step, so the loss never passes the limit |
+| `min_qty` | the step | the smallest order |
+
+A plan with `"side": "sell"` is sized the same way and written as a `sell` bracket order (stop above,
+target below). For a short a fresh price UNDER the plan's entry is the one that makes the risk bigger.
+
+`trader-budget/config.gold-demo.example.json` is a starting point for a small demo account on a 24h market:
+3,000 EUR, 1:500, 1 percent per trade, units of 0.01. Example, a short on gold futures (entry 4144.90, stop
+4151.55, risk 6.65 an ounce): 1 percent of 3,000 EUR is $33.71, so `floor(33.71 / 6.65)` = 5.06 ounces, a loss
+of $33.65 at the stop (never above the limit), $20,973 of exposure tying up $41.95 of margin. Leverage makes
+the exposure large for a small account: a gap or a fast market can fill past the stop, and a 0.16 percent
+move against the position is already the whole 1 percent. Alpaca's `place_stock_order` does not trade
+this: the report says so and the numbers are a ticket for your own broker's demo account.
 
 ## Rules
 

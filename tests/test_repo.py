@@ -39,7 +39,8 @@ class Repo(unittest.TestCase):
         self.assertEqual(found, sorted(SKILLS))
 
     def test_root_matches_the_reel(self):
-        root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git"))
+        # .claude holds the project-local copy of the skills, trader holds the tools' working files
+        root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d not in (".claude", "trader"))
         self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):
@@ -127,6 +128,17 @@ class Repo(unittest.TestCase):
         self.assertIs(cfg["require_stop"], True)
         self.assertIs(cfg.get("allow_short", False), False)
         self.assertIs(cfg.get("allow_margin", False), False)
+
+    def test_short_and_24h_are_off_in_the_stock_example_and_the_gold_demo_is_paper(self):
+        with open(os.path.join(ROOT, "trader-budget", "config.example.json")) as fh:
+            cfg = json.load(fh)
+        for k in ("allow_short", "allow_margin", "allow_24h"):
+            self.assertIs(cfg.get(k, False), False, k)
+        self.assertEqual(cfg.get("leverage", 1), 1)
+        with open(os.path.join(ROOT, "trader-budget", "config.gold-demo.example.json")) as fh:
+            gold = json.load(fh)
+        self.assertIs(gold["paper"], True)
+        self.assertEqual((gold["leverage"], gold["max_loss_per_trade_pct"]), (500, 1))
 
     def test_paper_trading_is_the_default(self):
         with open(os.path.join(ROOT, "trader-budget", "config.example.json")) as fh:

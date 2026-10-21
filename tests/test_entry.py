@@ -595,7 +595,7 @@ class SkillDoc(unittest.TestCase):
         self.assertGreater(len(text.splitlines()), 60)
         self.assertEqual(text[text.index("## Safety"):], risk[risk.index("## Safety"):])
         low = " ".join(text.lower().split())
-        for must in ("bar by bar", "can lag", "day trading loses most people money", "/trader-exit", "longs only", "in the background", "/loop", "nothing was placed", "10:15 am", "$364.18", "bar 8"):
+        for must in ("bar by bar", "can lag", "day trading loses most people money", "/trader-exit", "short side", "in the background", "/loop", "nothing was placed", "10:15 am", "$364.18", "bar 8"):
             self.assertIn(must, low)
         for never in ("\u2014", "tick " + "by tick", "real " + "time", "pro" + "fit"):
             self.assertNotIn(never, low)

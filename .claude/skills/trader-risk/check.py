@@ -54,6 +54,25 @@ What blocks an entry (on top):
   pdt           only with "pdt_guard": true: 3 day trades already in the last
                 5 business days (a 4th would trip the old pattern-day-trader rule)
 
+Short side. A short entry (a sell that goes short) needs "allow_short": true, then runs the
+same rules mirrored: its stop must be ABOVE the entry, its target below, and the loss is
+measured from the LOWER of the plan's entry and a fresh price (a price that fell since the
+plan means a bigger loss at the same stop). A short ties up margin like any entry: the
+notional / leverage must fit in your cash after the buffer, unless "allow_margin" is true.
+
+24h markets (futures, forex, crypto, CFDs: a plan from trader-exit with "market": "24h").
+They are off until you say "allow_24h": true, because the pack was built for US stocks and
+ETFs. With it on, the symbol may look like GC=F, EURUSD=X or BTC-USD, a bracket may carry
+fractional units, and the entry window is the plan's own session (its "session": open, close;
+no entries in the last 30 minutes, or between "no_entries_before_24h" and "no_entries_after_24h")
+instead of the NYSE hours. There is no holiday calendar for these markets.
+
+Leverage and currency. "leverage" above 1 is off until you say "allow_margin": true (an entry
+is blocked otherwise). With "leverage" above 1 the max order, position cap and cash checks
+count the margin an order ties up (notional / leverage), like trader-budget. "fx_rate" converts
+the money settings from your account currency into the instrument's, and
+"max_loss_per_trade_pct" makes the per-trade limit a percent of the budget.
+
 Exit code 0 when every order passes, 1 when any order is blocked.
 The verdicts go to trader/state/risk.json with a fingerprint of each order,
 so trader-broker only shows an order as ready if THIS exact order passed today.
@@ -73,7 +92,8 @@ DEFAULTS = {
     "max_orders_per_day": 10, "min_reward_risk": 1.0, "require_stop": True,
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "paper": True, "blocked": [], "allow_options": False, "allow_margin": False, "allow_short": False,
-    "pdt_guard": False,
+    "pdt_guard": False, "allow_24h": False, "leverage": 1, "fx_rate": 1, "max_loss_per_trade_pct": None,
+    "no_entries_before_24h": None, "no_entries_after_24h": None,
 }
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
@@ -85,6 +105,7 @@ TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop"}
 TIFS = {"day", "gtc", "opg", "cls", "ioc", "fok"}
 OCC = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
 TICKER = re.compile(r"^[A-Z]{1,5}([.\-][A-Z]{1,2})?$")
+TICKER_24H = re.compile(r"^\^?[A-Z][A-Z0-9.=\-]{0,11}$")       # GC=F, EURUSD=X, BTC-USD, ^GSPC
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 CENT = 0.005
 FRESH_MINUTES = 15
@@ -242,6 +263,86 @@ def window_check(now_et, c):
     return [], warns
 
 
+def _in_market_week(t):
+    """Futures and forex: Sunday 18:00 to Friday 17:00 New York time."""
+    wd = t.weekday()
+    if wd == 5:
+        return False
+    if wd == 6 and t.time() < datetime.time(18, 0):
+        return False
+    if wd == 4 and t.time() > datetime.time(17, 0):
+        return False
+    return True
+
+
+def _wall_after(open_dt, t):
+    at = datetime.datetime.combine(open_dt.date(), t)
+    return at if at >= open_dt else at + datetime.timedelta(days=1)
+
+
+def window_check_24h(now_et, sess, c):
+    """Reasons an entry cannot be placed now in a 24h market's own session (plan["session"])."""
+    o_t, c_t = hhmm(sess.get("open"), "session open"), hhmm(sess.get("close"), "session close")
+    if o_t is None or c_t is None:
+        return ["window: the plan's 24h session has no open or close"], []
+    weekends = bool(sess.get("weekends"))
+    stamp = now_et.strftime("%a %Y-%m-%d %H:%M")
+    warns = ["no holiday calendar for 24h markets: a holiday or a thin day is not checked"]
+    for back in (0, 1):
+        d = now_et.date() - datetime.timedelta(days=back)
+        o, cl = datetime.datetime.combine(d, o_t), datetime.datetime.combine(d, c_t)
+        if cl <= o:
+            cl += datetime.timedelta(days=1)
+        if not (o <= now_et < cl):
+            continue
+        if not weekends and not (_in_market_week(o) and _in_market_week(cl - datetime.timedelta(seconds=1))):
+            continue
+        b_t, a_t = c.get("no_entries_before_24h"), c.get("no_entries_after_24h")
+        before = _wall_after(o, hhmm(b_t, "no_entries_before_24h")) if b_t else o
+        after = _wall_after(o, hhmm(a_t, "no_entries_after_24h")) if a_t else cl - datetime.timedelta(minutes=30)
+        if now_et < before:
+            return ["window: no new entries before %s New York (it is %s)" % (before.strftime("%H:%M"),
+                                                                              now_et.strftime("%H:%M"))], warns
+        if now_et > after:
+            return ["window: no new entries after %s New York (it is %s)" % (after.strftime("%H:%M"),
+                                                                             now_et.strftime("%H:%M"))], warns
+        return [], warns
+    return ["window: the 24h session is closed (%s New York; the session is %s to %s%s)"
+            % (stamp, o_t.strftime("%H:%M"), c_t.strftime("%H:%M"), "" if weekends else ", Sunday 18:00 to Friday 17:00")], warns
+
+
+def convert_money(c, portfolio):
+    """Your money settings are in your account currency; fx_rate says how many units of the
+    instrument's currency one unit of it buys. Returns (config, portfolio) in the instrument's."""
+    fx = 1.0 if c.get("fx_rate") is None else _f(c.get("fx_rate"))
+    if fx is None or fx <= 0:
+        raise RiskError("fx_rate must be above 0")
+    budget_acct = _f(c.get("budget"))
+    c = dict(c)
+    pct = _f(c.get("max_loss_per_trade_pct"))
+    if pct:
+        if not 0 < pct <= 100:
+            raise RiskError("max_loss_per_trade_pct must be above 0 and at most 100")
+        if not budget_acct:
+            raise RiskError("max_loss_per_trade_pct needs a budget in the config")
+        c["max_loss_per_trade_usd"] = round(budget_acct * pct / 100.0 * fx, 2)
+    elif fx != 1:
+        for k in ("max_loss_per_trade_usd",):
+            if _f(c.get(k)):
+                c[k] = round(float(c[k]) * fx, 2)
+    if fx != 1:
+        for k in ("budget", "max_order_usd", "min_order_usd", "max_daily_loss_usd"):
+            if _f(c.get(k)):
+                c[k] = round(float(c[k]) * fx, 2)
+        if isinstance(portfolio, dict) and _f(portfolio.get("cash")) is not None:
+            portfolio = dict(portfolio, cash=round(float(portfolio["cash"]) * fx, 2))
+    lev = 1.0 if c.get("leverage") is None else _f(c.get("leverage"))
+    if lev is None or lev < 1:
+        raise RiskError("leverage must be 1 or more")
+    c["leverage"] = lev
+    return c, portfolio
+
+
 def business_days(today, n=5):
     """The last n NYSE trading days up to and including today, newest first."""
     out, d = [], today
@@ -377,6 +478,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh"""
     c = dict(DEFAULTS)
     c.update(cfg or {})
+    c, portfolio = convert_money(c, portfolio)
+    lev = c["leverage"]
     prices = {str(k).upper(): float(v) for k, v in (prices or {}).items() if _f(v)}
     now_utc = now or parse_now(None)
     now_et = to_eastern(now_utc)
@@ -424,6 +527,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         tif = str(o.get("time_in_force", "day")).strip().lower()
         qty, notional = o.get("qty"), o.get("notional")
         plan = o.get("plan") if isinstance(o.get("plan"), dict) else {}
+        is24 = str(plan.get("market") or "").lower() == "24h" and isinstance(plan.get("session"), dict)
         oc = str(o.get("order_class") or "").strip().lower()
         legs = o.get("take_profit_limit_price") is not None or o.get("stop_loss_stop_price") is not None
         bracket = oc == "bracket" or (not oc and legs)
@@ -462,7 +566,11 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if notional is not None:
                 reasons.append("format: a bracket order needs a whole-share qty, not a notional amount")
             elif _f(qty) is not None and abs(_f(qty) - round(_f(qty))) > 1e-9:
-                reasons.append("format: a bracket order takes whole shares only, got qty %r" % qty)
+                if is24:
+                    warns.append("fractional units (%s): Alpaca's bracket takes whole shares only, so this is a "
+                                 "ticket for your own broker" % qty)
+                else:
+                    reasons.append("format: a bracket order takes whole shares only, got qty %r" % qty)
             if tif not in ("day", "gtc"):
                 reasons.append("format: a bracket order needs time_in_force day or gtc, got %r" % tif)
             if o.get("take_profit_limit_price") is None or o.get("stop_loss_stop_price") is None:
@@ -479,6 +587,15 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                                "(\"allow_options\": false)" % sym)
             else:
                 warns.append("option order: options can lose 100%% of what you pay")
+        elif is24:
+            if not c.get("allow_24h"):
+                reasons.append("asset: %s is a 24h-market order (futures, forex, crypto or CFD); those are off "
+                               "(\"allow_24h\": false). This pack was built for US stocks and ETFs" % sym)
+            elif not TICKER_24H.match(sym):
+                reasons.append("asset: %s does not look like a Yahoo symbol such as GC=F, EURUSD=X or BTC-USD" % sym)
+            else:
+                warns.append("24h market: %s is outside Alpaca's stock tool; this is a ticket for your own "
+                             "broker's demo or live account" % sym)
         elif sym and ("/" in sym or not TICKER.match(sym)):
             reasons.append("asset: %s does not look like a US stock or ETF ticker; "
                            "this pack trades stocks and ETFs only" % sym)
@@ -494,11 +611,13 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         if ref is None:
             cands = [(p, w) for p, w in ((plan_entry, "plan"), (live, "price")) if p]
             if cands:
-                ref, ref_from = max(cands, key=lambda x: x[0])
+                pick = min if side == "sell" else max          # the price that makes the loss bigger
+                ref, ref_from = pick(cands, key=lambda x: x[0])
                 ref = _cent(ref)
-                if live and ref_from == "price" and plan_entry and live > plan_entry + CENT:
-                    info.append("%s last %s is above the plan's entry %s: the risk is measured from %s"
-                                % (sym, _p(ref), _p(plan_entry), _p(ref)))
+                if live and ref_from == "price" and plan_entry and \
+                        ((live < plan_entry - CENT) if side == "sell" else (live > plan_entry + CENT)):
+                    info.append("%s last %s is %s the plan's entry %s: the risk is measured from %s"
+                                % (sym, _p(ref), "under" if side == "sell" else "above", _p(plan_entry), _p(ref)))
             elif sym in prices:
                 ref, ref_from = prices[sym], "stale price"
         if plan_entry and live is None and sym in prices and price_times is not None and typ == "market":
@@ -530,27 +649,33 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         # blocked list and size
         if sym in blocked:
             later.append("blocked: %s is on your blocked list" % sym)
+        if lev > 1 and not c.get("allow_margin"):
+            later.append("margin: leverage 1:%g is off (\"allow_margin\": false). Trading on leverage can lose "
+                         "more than you put in" % lev)
+        tied = value / lev if value is not None else None      # the margin an order ties up
         if value is not None:
             if value < float(c.get("min_order_usd") or 0) - CENT:
                 later.append("size: %s is under your %s minimum order"
                              % (money(value), money(c["min_order_usd"])))
-            if c.get("max_order_usd") and value > float(c["max_order_usd"]) + CENT:
-                later.append("size: %s is over your %s max order"
-                             % (money(value), money(c["max_order_usd"])))
+            if c.get("max_order_usd") and tied > float(c["max_order_usd"]) + CENT:
+                later.append("size: %s%s is over your %s max order"
+                             % (money(tied), " of margin (%s at 1:%g)" % (money(value), lev) if lev > 1 else "",
+                                money(c["max_order_usd"])))
 
         # account effects, simulated in order
         cash = acct["cash"]
         total = cash + sum(acct["values"].values())
         buffer_usd = total * float(c.get("cash_buffer_pct") or 0) / 100.0
-        if value is not None and side == "buy" and kind == "entry":
-            after_cash = cash - value
+        short_entry = side == "sell" and kind == "entry"
+        if value is not None and ((side == "buy" and kind == "entry") or (short_entry and c.get("allow_short"))):
+            after_cash = cash - tied
             if after_cash < -CENT and not c.get("allow_margin"):
-                later.append("cash: needs %s but only %s cash; that would be margin (borrowed money)"
-                             % (money(value), money(cash)))
+                later.append("cash: needs %s%s but only %s cash; that would be margin (borrowed money)"
+                             % (money(tied), " of margin" if lev > 1 or short_entry else "", money(cash)))
             elif after_cash < buffer_usd - CENT:
                 later.append("cash: leaves %s cash, under your %s%% buffer of %s"
                              % (money(max(after_cash, 0)), _pct(c["cash_buffer_pct"]), money(buffer_usd)))
-            pos_after = held_value + value
+            pos_after = abs(held_value) + tied
             limit = total * float(c.get("max_position_pct") or 100) / 100.0
             if total > 0 and pos_after > limit + CENT:
                 later.append("position: %s would be %s, %.1f%% of the %s account, over your %s%% cap"
@@ -623,7 +748,12 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if cap_t and len(entries_today) + batch_entries >= cap_t:
                 later.append("trades: %d entries placed today plus %d passed earlier in this batch, your limit "
                              "is %d a day" % (len(entries_today), batch_entries, cap_t))
-            later.extend(win_reasons)
+            if is24:
+                w24, w24_warns = window_check_24h(now_et, plan["session"], c)
+                later.extend(w24)
+                warns.extend(w for w in w24_warns if w not in warns)
+            else:
+                later.extend(win_reasons)
             if c.get("pdt_guard") and pdt_n >= 3:
                 later.append("pdt: %d day trades in the last 5 business days (%s); a 4th trips the "
                              "pattern-day-trader rule your broker applies (\"pdt_guard\": true)"
@@ -665,7 +795,15 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if kind == "entry" and side in ("buy", "sell"):
                 batch_entries += 1
                 batch_loss += max_loss or 0.0
-            if side == "buy":
+            if side == "buy" and held < -1e-9:                 # buying back a short: release its margin
+                if tied is not None:
+                    acct["cash"] += tied
+                    acct["values"]["~margin"] = max(acct["values"].get("~margin", 0.0) - tied, 0.0)
+                if q is not None:
+                    acct["shares"][sym] = held + q
+                elif ref and value is not None:
+                    acct["shares"][sym] = held + value / ref
+            elif side == "buy":
                 if value is not None:
                     acct["cash"] -= value
                     acct["values"][sym] = acct["values"].get(sym, 0.0) + value
@@ -673,6 +811,14 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     acct["shares"][sym] = held + q
                 elif ref and value is not None:
                     acct["shares"][sym] = held + value / ref
+            elif side == "sell" and short_entry:               # a short: its margin is set aside, not sale proceeds
+                if tied is not None:
+                    acct["cash"] -= tied
+                    acct["values"]["~margin"] = acct["values"].get("~margin", 0.0) + tied
+                if q is not None:
+                    acct["shares"][sym] = held - q
+                elif ref and value is not None:
+                    acct["shares"][sym] = held - value / ref
             elif side == "sell":
                 if value is not None:
                     acct["cash"] += value

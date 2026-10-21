@@ -8,7 +8,8 @@ description: >-
   days, and re-runs the same rule on every past session. Prints the odds of
   target first, stop first, or neither by the close, where the price sits at
   the close, the average R, the history, and one honest verdict, then hands
-  off to /trader-budget. Use when the user says "run the time machine",
+  off to /trader-budget. Replays a long, a short (stop above, target below)
+  and a 24h market's own session (gold futures, forex, crypto). Use when the user says "run the time machine",
   "replay this trade", "what are the odds", "simulate this trade", "monte
   carlo", "backtest this setup", "how often does this hit the target", "is
   this a coin flip", or after /trader-exit writes a plan, before
@@ -136,6 +137,23 @@ At 1R the target has to come first in half of the replays that hit one
 side. It did in 53.6 %. The replays came out close to a coin flip, and the
 real history was slightly worse than even. That is the honest answer for this setup, and it is what
 the user should hear before `/trader-budget` sizes 8 shares.
+
+## Short side and 24h markets
+
+- **Short.** A plan with `"side": "sell"` is replayed mirrored: the stop is touched when a bar's high
+  reaches it, the target when its low reaches it, "green" means below the entry at the end, and the
+  history replay enters on the first close BELOW the opening-range low. Flags work the same:
+  `--side short --stop 370.04 --target 352.46`.
+- **24h markets.** A plan from `/trader-exit --market 24h` carries its `"session"` (open and close, New
+  York time). The pool is built from that window instead of 9:30 to 16:00: a full session is every
+  5-minute bar from the open to the close (104 bars for 08:20 to 17:00), and a session that runs past
+  midnight belongs to the date it started on. A session with a missing bar (a holiday, a halt) is left
+  out like a half day. Symbols such as `GC=F`, `EURUSD=X` and `BTC-USD` work. With flags:
+  `--symbol GC=F --market 24h --anchor 08:20 --close 17:00`. Bare clock times are 24-hour there
+  (`--until 16:55`).
+- Yahoo keeps about 60 days of 5-minute bars, so a 24h pool is also about 40 to 60 sessions, and the
+  history replay says whether the rule worked on that symbol. Read it before you trust the plan: a rule
+  borrowed from the stock market's open has no reason to work on gold by itself.
 
 ## Rules
 

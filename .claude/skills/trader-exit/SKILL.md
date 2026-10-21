@@ -4,15 +4,17 @@ description: >-
   Exit Planner. Sets your stop and your target before you enter, so you know
   when to get out. Reads the entry from trader-entry (or a price you give),
   puts the stop at the opening-range midpoint by default (or the range low,
-  your price, a percent, or a multiple of the ATR), rounds it down to the
-  cent, and sets the target at 2R (or 1R, or your price). Refuses a stop at or
-  above the entry, a target at or below it, or a stop too tight to survive the
-  spread, and says why. Writes trader/plan.json for the Time Machine, the
-  Budget Manager and Price Alerts. Long side only. Use when the user says
+  your price, a percent, or a multiple of the ATR), rounds it away from the
+  entry to the cent, and sets the target at 2R (or 1R, or your price). Refuses
+  a stop on the wrong side of the entry, a target on the wrong side, or a stop
+  too tight to survive the spread, and says why. Works for a long, for a short
+  (stop above, target below) and for a 24h market with its own session. Writes
+  trader/plan.json for the Time Machine, the Budget Manager and Price Alerts.
+  Use when the user says
   "where's my stop", "set my stop and target", "plan the exit", "when do I get
   out", "stop loss", "what's my R", "risk reward", or right after
   /trader-entry triggers, before /trader-timemachine.
-argument-hint: "[--stop or-mid|or-low|price:X|pct:X|atr:K] [--target 2R|1R|price:X]"
+argument-hint: "[--stop or-mid|or-low|or-high|price:X|pct:X|atr:K] [--target 2R|1R|price:X] [--side buy|sell] [--market stock|24h]"
 ---
 
 # trader-exit
@@ -52,10 +54,11 @@ level`, `--offline FILE` (a saved Yahoo chart JSON for an ATR stop).
 | stop | where it goes |
 | --- | --- |
 | `or-mid` | the opening-range midpoint (the default for an opening-range breakout) |
-| `or-low` | the opening-range low: wider, so fewer shares for the same max loss |
+| `or-low` | the opening-range low: wider, so fewer shares for the same max loss (a long) |
+| `or-high` | the opening-range high: the wide stop of a short |
 | `price:X` | your price |
-| `pct:X` | X percent under the entry |
-| `atr:K` | K times the 14-bar ATR under the entry, on the session's bars up to the entry bar. With fewer than 14 bars by then it averages all of them and says so |
+| `pct:X` | X percent under the entry (above it for a short) |
+| `atr:K` | K times the 14-bar ATR under the entry (above it for a short), on the session's bars up to the entry bar. With fewer than 14 bars by then it averages all of them and says so |
 
 A level setup has no opening range to lean on, so it needs a stop you name.
 
@@ -65,7 +68,8 @@ A level setup has no opening range to lean on, so it needs a stop you name.
 - **Refused, with the reason.** A stop at or above the entry. A target at or
   below it. A risk under 0.05% of the price: too tight to survive the
   spread, normal wiggle would stop you out. An entry.json that has not
-  triggered (unless you give `--entry`). A short: v2 plans longs only.
+  triggered (unless you give `--entry`). For a short the mirror: a stop at or below the
+  entry, a target at or above it, or a target that would be at or below $0.
 - **Flat by.** 15:55 by default (or `flat_by` in the config). Out by then,
   win or lose, no overnight hold. On a 1:00 p.m. early close it moves up to
   12:55. An entry at or after the flat-by time is refused.
@@ -105,6 +109,28 @@ Exit plan: TSLA long, Mon 2026-10-19, opening-range breakout on 5-minute bars
 The default 2R target would be 364.18 + 2 x 5.86 = 375.90. trader-budget then
 sizes it: a $50 max loss per trade buys floor(50 / 5.86) = 8 shares.
 
+## Short side
+
+The side comes from `trader/entry.json` (or `--side sell` with flags). A short plan has the stop ABOVE
+the entry (rounded UP to the cent, away from the entry) and the target below it:
+
+```
+Exit plan: TSLA short, Mon 2026-10-19, opening-range breakout on 5-minute bars
+  Entry         $364.18 at 10:15 AM (bar 8)
+  Stop          $370.04  opening-range midpoint ...
+  Target        $352.46  2R (two times the risk)
+```
+
+`or-low` is refused for a short and `or-high` for a long. `plan.json` carries `"side": "sell"`.
+
+## 24h markets
+
+With `--market 24h --anchor HH:MM --close HH:MM`, or an entry.json from `entry.py --market 24h`, the plan
+carries `"market": "24h"` and its `"session"`. Flat by defaults to 5 minutes before the session close
+(`flat_by_24h` in `trader/config.json` or `--flat-by` changes it); a session that runs past midnight
+flattens after midnight, and an entry at or after flat-by is refused. The risk is "a unit", not "a
+share": an ounce of gold, a contract, a coin.
+
 ## Rules
 
 - The stop and the target are set before the entry, never after.
@@ -113,7 +139,8 @@ sizes it: a $50 max loss per trade buys floor(50 / 5.86) = 8 shares.
   never prints a P&L or a return.
 - Nothing here promises winning trades or money. A 1R target is not a
   prediction that the price gets there.
-- Long side only. v2 plans longs only.
+- Long side by default. A short (`--side sell`, or an entry.json that says `"side": "sell"`) puts the
+  stop above the entry and the target below. Say that a short has no ceiling: a gap up fills past the stop.
 
 ## What it never does
 

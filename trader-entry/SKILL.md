@@ -7,12 +7,13 @@ description: >-
   that CLOSES above the range high, or above a level you give it (like a
   20-day high from the scanner), with an optional volume check. Says waiting
   and how far, triggered with the time and the price, expired, or not open
-  yet, and writes trader/entry.json for /trader-exit. Long side only. It never
+  yet, and writes trader/entry.json for /trader-exit. Long or short side, stock
+  hours or a 24h market you name (gold futures, forex, crypto). It never
   places an order. Use when the user says "tell me when to get in", "watch
   TSLA", "has it broken out", "did it break the opening range", "entry
   signal", "time my entry", "check my watchlist", or after /trader-scanner
   and /trader-news, before /trader-exit.
-argument-hint: "[TICKER] [--setup orb|level] [--interval 5m|1m]"
+argument-hint: "[TICKER] [--setup orb|level] [--interval 5m|1m] [--side buy|sell] [--market stock|24h]"
 ---
 
 # trader-entry
@@ -114,14 +115,56 @@ Next: set the stop and target BEFORE you buy: /trader-exit (exit.py plan --from 
 With `--min-volume-x 1` the 10:10 bar is too thin (0.60x the range's volume)
 and the trigger moves to 10:35 AM at 365.75 (the 10:30 bar, 7.98x).
 
+## Short side
+
+`--side sell` (or `short`) mirrors every rule. The opening-range level is the range LOW, and the
+trigger is the first completed bar that CLOSES BELOW it. A level setup triggers on the first close
+below `--level` (for example a 20-day low). The result and `trader/entry.json` carry
+`"side": "sell"`, and `/trader-exit` then puts the stop ABOVE the entry. After a short scan
+(`scan.py daily --side short`) the watchlist carries `"side": "sell"` and `entry.py watchlist`
+follows it without a flag.
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --side sell --write
+```
+
+## 24h markets (gold futures, forex, crypto)
+
+`--market 24h` is for symbols with no stock-market open: `GC=F` (gold futures), `EURUSD=X`,
+`BTC-USD`. There is no 9:30 bell, so YOU name the session, in New York time:
+
+| flag | meaning | default |
+| --- | --- | --- |
+| `--anchor HH:MM` | where the opening range starts | 08:20 (the COMEX gold open; 03:00 is the London open, 18:00 the CME Globex open) |
+| `--close HH:MM` | where the session ends; at or before the anchor means the next day | 17:00 (the CME daily break) |
+| `--weekends` | Saturday and Sunday count (crypto) | off: Sunday 18:00 to Friday 17:00 |
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check GC=F --market 24h --anchor 08:20 --side sell --write
+python3 "${CLAUDE_SKILL_DIR}/entry.py" watch GC=F --market 24h --until 16:30
+```
+
+Entries stop 30 minutes before the close, or at `"no_entries_after_24h"` in `trader/config.json`
+(and `"no_entries_before_24h"`). The result and `trader/entry.json` carry the session, so
+`/trader-exit`, `/trader-timemachine`, `/trader-alerts` and `/trader-risk` follow the same hours.
+A session that runs past midnight belongs to the date it started on.
+
+Be honest about what this is. The opening-range idea comes from the stock market's 9:30 open, where a
+burst of orders sets the range. A 24h market has no such moment, so the anchor is your choice, and the
+rule has no reason to work there until the Time Machine's history replay says it did on that symbol.
+There is no holiday calendar for these markets: a holiday shows up as missing bars, and the result
+says so. Yahoo's futures and forex prices are delayed and unofficial.
+
 ## Rules
 
 - Bar by bar, on free Yahoo 1-minute or 5-minute bars. They are unofficial
   and can lag. Say so when a minute matters.
 - A signal is information, not an order, and not a promise. Nothing here
   promises winning trades or money.
-- Long side only. v2 plans longs only. If the user wants a short, say that.
-- One trigger per setup per day: the first close above. Later closes do not
+- Long side by default. `--side sell` is the short side: it waits for a close BELOW the level.
+  A short can lose more than it risked, and trader-risk blocks it unless the config says
+  `"allow_short": true`. Say both.
+- One trigger per setup per day: the first close beyond the level. Later closes do not
   reset it.
 - Never call an entry early because a bar looks like it will close above.
 

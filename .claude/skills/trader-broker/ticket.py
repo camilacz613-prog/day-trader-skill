@@ -17,9 +17,22 @@ work around the one moment that matters, your yes:
   result    records what happened after the Allow once / Deny card:
             placed (with the broker's order id), denied, or failed.
   fill      records a fill in trader/portfolio.json (cash and shares).
-  flatten   builds a sell ticket that closes a symbol's open position by
-            flat_by. It still goes through trader-risk and your yes.
+  flatten   builds a ticket that closes a symbol's open position by flat_by:
+            a sell for a long, a buy to cover for a short. It still goes
+            through trader-risk and your yes.
   log       prints today's decisions.
+
+Short side. A bracket sell whose stop sits above its entry is a short and reads
+"SELL SHORT". Its fill makes a negative position in trader/portfolio.json
+(needs "allow_short": true in the config), and a buy that closes it covers it.
+
+24h markets and manual brokers. An order whose plan says "market": "24h" (gold futures,
+forex, crypto, CFDs), or a config with "broker": "manual", is NOT sent through Alpaca's
+place_stock_order. The ticket says so and gives the numbers to enter at your own broker. Your
+yes is recorded the same way, `result --status placed` records that you placed it, and the
+fill is logged for the day's counts but NOT added to trader/portfolio.json (leveraged
+positions and a second currency do not fit its cash and shares accounting; your broker's
+platform is the account for those).
 
     python3 ticket.py show                    # every order, READY or not
     python3 ticket.py show --index 1 --json   # one ticket as JSON
@@ -186,6 +199,27 @@ def _p(v):
     return "%.2f" % float(v)
 
 
+def is_24h(order):
+    plan = order.get("plan") if isinstance(order.get("plan"), dict) else {}
+    return str(plan.get("market") or "").lower() == "24h"
+
+
+def is_manual(order, cfg=None):
+    """True when the order is not sent through a connector: a 24h-market order, or "broker": "manual"."""
+    return is_24h(order) or str((cfg or {}).get("broker", "")).lower() == "manual"
+
+
+def is_short_entry(order):
+    """A sell with a bracket whose stop is above its entry opens a short."""
+    if str(order.get("side", "")).lower() != "sell" or not is_bracket(order):
+        return False
+    plan = order.get("plan") or {}
+    stop = _f(order.get("stop_loss_stop_price")) or _f(plan.get("stop"))
+    entry = _f(order.get("limit_price")) if str(order.get("type", "market")) == "limit" and _f(order.get("limit_price")) \
+        else _f(plan.get("entry"))
+    return bool(stop and entry and stop > entry)
+
+
 def is_bracket(order):
     oc = str(order.get("order_class") or "").lower()
     legs = order.get("take_profit_limit_price") is not None or order.get("stop_loss_stop_price") is not None
@@ -213,7 +247,7 @@ def max_loss(order):
 
 def plain_parts(order):
     """The ticket in plain words, one part per line."""
-    side = str(order.get("side", "")).upper()
+    side = "SELL SHORT" if is_short_entry(order) else str(order.get("side", "")).upper()
     sym = order.get("symbol", "?")
     typ = str(order.get("type", "market"))
     tif = TIF_WORDS.get(str(order.get("time_in_force", "day")), order.get("time_in_force"))
@@ -344,7 +378,7 @@ def kind_of(order, rv):
     """entry or exit, as trader-risk saw it (older checks: a buy is an entry)."""
     if rv and rv.get("kind"):
         return rv["kind"]
-    return "entry" if str(order.get("side", "")).lower() == "buy" else "exit"
+    return "entry" if str(order.get("side", "")).lower() == "buy" or is_short_entry(order) else "exit"
 
 
 # ---------------------------------------------------------------- rendering
@@ -354,7 +388,9 @@ def render(order, idx, total, cfg, risk, state, today):
     broker = str(cfg.get("broker", "alpaca")).lower()
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
-    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, "Interactive Brokers" if broker == "ibkr" else "Alpaca")]
+    manual = is_manual(order, cfg)
+    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, "your own broker (manual)" if manual
+                                         else "Interactive Brokers" if broker == "ibkr" else "Alpaca")]
     for part in plain_parts(order):
         lines.append("  " + part)
     if order.get("why"):
@@ -362,7 +398,22 @@ def render(order, idx, total, cfg, risk, state, today):
     lines.append("  " + label)
     for w in (rv or {}).get("warnings", []):
         lines.append("  note: " + w)
-    if broker == "ibkr":
+    if manual:
+        plan = order.get("plan") or {}
+        lines.append("  Claude does not place this one. %s" % (
+            "It is a 24h-market order, outside Alpaca's stock tool." if is_24h(order)
+            else "Your config says \"broker\": \"manual\"."))
+        lines.append("  Enter it yourself in your broker's platform (a demo account first) with these numbers:")
+        lines.append("    %s %s %s at market, stop-loss %s, take-profit %s" % (
+            "sell" if str(order.get("side")).lower() == "sell" else "buy", _str_num(order.get("qty")),
+            order.get("symbol"), order.get("stop_loss_stop_price", "-"), order.get("take_profit_limit_price", "-")))
+        if _f(plan.get("leverage")) and _f(plan.get("leverage")) != 1:
+            lines.append("    leverage 1:%g, about %s of margin for %s of exposure" % (
+                _f(plan["leverage"]), _money(plan.get("margin") or 0), _money(plan.get("notional") or 0)))
+        if plan.get("session"):
+            lines.append("    flat by %s New York (session %s to %s)" % (
+                plan.get("flat_by") or "the close", plan["session"].get("open"), plan["session"].get("close")))
+    elif broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
     else:
@@ -374,7 +425,7 @@ def render(order, idx, total, cfg, risk, state, today):
             lines.append("  that cancel each other: when one fills, the other is canceled.")
     if ready:
         lines.append("  Reply \"yes\" to place this one order, or \"no\" to skip it.")
-        if broker != "ibkr":
+        if broker != "ibkr" and not manual:
             lines.append("  Claude's own card then asks again: Allow once places it, Deny stops it.")
     return "\n".join(lines), ready
 
@@ -382,9 +433,11 @@ def render(order, idx, total, cfg, risk, state, today):
 def ticket_json(order, idx, cfg, risk, state, today):
     ready, label, rv = status_of(order, risk, state, today)
     loss, stop = max_loss(order)
+    manual = is_manual(order, cfg)
     return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-            "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
+            "broker": "manual" if manual else cfg.get("broker", "alpaca"),
+            "tool": None if manual else "place_stock_order", "manual": manual,
             "tool_input": tool_input(order), "why": order.get("why", ""),
             "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
 
@@ -393,7 +446,9 @@ def ticket_json(order, idx, cfg, risk, state, today):
 
 def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
     """Record a filled order in trader/portfolio.json: cash and shares, with a
-    cost-basis lot per buy (oldest lots are relieved first on a sell)."""
+    cost-basis lot per buy (oldest lots are relieved first on a sell). With
+    "allow_short" in the config, a sell with nothing to sell opens a short (negative
+    shares) and a buy covers it."""
     pf = read_json(portfolio_path, "portfolio", required=False)
     if pf is None:
         budget = cfg.get("budget")
@@ -409,7 +464,27 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
     for p in pf.setdefault("positions", []):
         if str(p.get("ticker", "")).upper() == symbol:
             pos = p
-    if side == "buy":
+    if side == "buy" and pos is not None and float(pos.get("shares", 0)) < -1e-9:      # cover a short
+        short = -float(pos["shares"])
+        if qty > short + 1e-9:
+            raise TicketError("cannot record buying %s %s: it covers only the %s you are short; record the "
+                              "cover first, then the buy" % (_str_num(qty), symbol, _str_num(short)))
+        left = qty
+        for lot in sorted(pos.get("lots", []), key=lambda l: l.get("date", "")):
+            if left <= 1e-9:
+                break
+            have = -float(lot["shares"])
+            take = min(left, have)
+            per = float(lot["cost"]) / float(lot["shares"]) if float(lot["shares"]) else 0
+            lot["cost"] = round(float(lot["cost"]) + per * take, 2)
+            lot["shares"] = round(float(lot["shares"]) + take, 6)
+            left -= take
+        pos["lots"] = [l for l in pos.get("lots", []) if abs(float(l["shares"])) > 1e-9]
+        pos["shares"] = round(float(pos["shares"]) + qty, 6)
+        if abs(pos["shares"]) <= 1e-9:
+            pf["positions"].remove(pos)
+        pf["cash"] = round(float(pf.get("cash", 0)) - cost, 2)
+    elif side == "buy":
         if pos is None:
             pos = {"ticker": symbol, "shares": 0.0, "lots": []}
             pf["positions"].append(pos)
@@ -417,10 +492,21 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
         lots.append({"id": "%s-%d" % (symbol, len(lots) + 1), "date": date, "shares": qty, "cost": cost})
         pos["shares"] = round(float(pos.get("shares", 0)) + qty, 6)
         pf["cash"] = round(float(pf.get("cash", 0)) - cost, 2)
+    elif side == "sell" and (pos is None or float(pos.get("shares", 0)) + 1e-9 < qty) and \
+            (cfg or {}).get("allow_short") and (pos is None or float(pos.get("shares", 0)) <= 1e-9):
+        if pos is None:                                    # open or add to a short: negative shares
+            pos = {"ticker": symbol, "shares": 0.0, "lots": []}
+            pf["positions"].append(pos)
+        lots = pos.setdefault("lots", [])
+        lots.append({"id": "%s-S%d" % (symbol, len(lots) + 1), "date": date, "shares": -qty, "cost": -cost})
+        pos["shares"] = round(float(pos.get("shares", 0)) - qty, 6)
+        pf["cash"] = round(float(pf.get("cash", 0)) + cost, 2)
     else:
         if pos is None or float(pos.get("shares", 0)) + 1e-9 < qty:
-            raise TicketError("cannot record selling %s %s: the portfolio holds %s"
-                              % (_str_num(qty), symbol, pos.get("shares", 0) if pos else 0))
+            raise TicketError("cannot record selling %s %s: the portfolio holds %s%s"
+                              % (_str_num(qty), symbol, pos.get("shares", 0) if pos else 0,
+                                 "" if (cfg or {}).get("allow_short") else
+                                 " (a short sale needs \"allow_short\": true in the config)"))
         left = qty
         for lot in sorted(pos.get("lots", []), key=lambda l: l.get("date", "")):
             if left <= 1e-9:
@@ -516,7 +602,10 @@ def cmd_approve(a):
     state.setdefault("orders", []).append(rec)
     write_json(a.state, state)
     print("Recorded your yes for order %d: %s." % (a.index, plain(order)))
-    if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
+    if is_manual(order, cfg):
+        print("Now place it yourself at your own broker (a demo account first) with the numbers on the ticket,")
+        print("then: ticket.py result --index %d --status placed|denied|failed" % a.index)
+    elif str(cfg.get("broker", "alpaca")).lower() == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
     else:
         print("Now call place_stock_order with exactly:")
@@ -558,9 +647,14 @@ def cmd_result(a):
     write_json(a.state, state)
     print("Recorded order %d as %s." % (a.index, a.status))
     if a.status == "placed" and a.filled_qty and a.filled_price:
-        apply_fill(a.portfolio, cfg, rec["symbol"], rec["side"], a.filled_qty, a.filled_price, today)
-        log_fill(a.state, now, today, rec["symbol"], rec["side"], a.filled_qty, a.filled_price)
-        print("Added the fill to %s." % a.portfolio)
+        if is_24h(order):
+            log_fill(a.state, now, today, rec["symbol"], rec["side"], a.filled_qty, a.filled_price)
+            print("Logged the fill. A 24h-market position is not added to %s: your broker's platform is the "
+                  "account for it." % a.portfolio)
+        else:
+            apply_fill(a.portfolio, cfg, rec["symbol"], rec["side"], a.filled_qty, a.filled_price, today)
+            log_fill(a.state, now, today, rec["symbol"], rec["side"], a.filled_qty, a.filled_price)
+            print("Added the fill to %s." % a.portfolio)
     elif a.status == "placed":
         print("When it fills, record it: ticket.py fill --symbol %s --side %s --qty Q --price P"
               % (rec["symbol"], rec["side"]))
@@ -588,24 +682,35 @@ def cmd_flatten(a):
     sym = a.symbol.strip().upper()
     now, today = _clock(a)
     source = "the broker, get_open_position"
+    plan = read_json(a.plan, "plan", required=False) or {}
+    same_plan = str(plan.get("symbol", "")).upper() == sym
+    side = a.side
     if a.qty is not None:
         qty = _f(a.qty)
         if qty is None or qty <= 0:
             raise TicketError("--qty wants the number of shares you hold, like --qty 8")
+        if side is None:
+            side = "buy" if same_plan and str(plan.get("side", "")).lower() == "sell" else "sell"
     else:
         pf = read_json(a.portfolio, "portfolio", required=False) or {}
-        qty = sum(_f(p.get("shares", p.get("qty"))) or 0 for p in pf.get("positions", [])
-                  if str(p.get("ticker") or p.get("symbol") or "").upper() == sym)
+        held = sum(_f(p.get("shares", p.get("qty"))) or 0 for p in pf.get("positions", [])
+                   if str(p.get("ticker") or p.get("symbol") or "").upper() == sym)
         source = a.portfolio
-        if qty <= 1e-9:
+        if abs(held) <= 1e-9:
             raise TicketError("nothing to flatten: no %s shares in %s. Check the broker (get_open_position "
                               "%s) and pass --qty if you do hold some" % (sym, a.portfolio, sym))
-    plan = read_json(a.plan, "plan", required=False) or {}
-    flat_by = (plan.get("flat_by") if str(plan.get("symbol", "")).upper() == sym else None) \
-        or cfg.get("flat_by") or "15:55"
-    order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market", "time_in_force": "day",
-             "why": "flat by %s New York: closes the %s day trade before the close (qty from %s)"
-             % (flat_by, sym, source)}
+        qty = abs(held)
+        if side is None:
+            side = "buy" if held < 0 else "sell"
+        elif (side == "buy") != (held < 0):
+            raise TicketError("%s is %s in %s: flatten with a %s, not a %s" % (
+                sym, "short" if held < 0 else "long", a.portfolio, "buy" if held < 0 else "sell", side))
+    flat_by = (plan.get("flat_by") if same_plan else None) or cfg.get("flat_by") or "15:55"
+    order = {"symbol": sym, "side": side, "qty": _str_num(qty), "type": "market", "time_in_force": "day",
+             "why": "flat by %s New York: %s the %s day trade before the close (qty from %s)"
+             % (flat_by, "covers" if side == "buy" else "closes", sym, source)}
+    if same_plan and str(plan.get("market", "")).lower() == "24h" and isinstance(plan.get("session"), dict):
+        order["plan"] = {"market": "24h", "session": plan["session"], "flat_by": flat_by}
     old = read_json(a.orders, "orders", required=False)
     replaced = len(old.get("orders", [])) if isinstance(old, dict) else 0
     doc = {"created_by": "trader-broker", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "status": "proposed",
@@ -619,7 +724,8 @@ def cmd_flatten(a):
     if a.qty is None:
         print("The qty comes from %s. Check it against get_open_position %s before you say yes." % (source, sym))
     print("Next:")
-    print("  1. trader-risk: check.py. A sell that only closes what you hold is never blocked by the daily")
+    print("  1. trader-risk: check.py. A %s that only closes what you hold is never blocked by the daily"
+          % ("buy to cover" if side == "buy" else "sell"))
     print("     limits or the entry window.")
     print("  2. ticket.py show, then the user's yes for this one order.")
     print("  3. If the bracket's stop-loss and take-profit are still open, Alpaca holds these shares for them")
@@ -692,9 +798,11 @@ def main(argv=None):
     p.add_argument("--portfolio", default="trader/portfolio.json")
     p.add_argument("--config", default="trader/config.json")
     p.add_argument("--state", default="trader/state/broker.json")
-    p = sub.add_parser("flatten", help="a sell ticket that closes a symbol's position by flat_by")
+    p = sub.add_parser("flatten", help="a ticket that closes a symbol's position by flat_by (sell, or buy to cover)")
     p.add_argument("--symbol", required=True)
     p.add_argument("--qty", help="shares you hold, from get_open_position (default: trader/portfolio.json)")
+    p.add_argument("--side", choices=["buy", "sell"],
+                   help="buy to cover a short, sell to close a long (default: from the portfolio or the plan)")
     p.add_argument("--orders", default="trader/orders.json", help="where the ticket is written")
     p.add_argument("--portfolio", default="trader/portfolio.json")
     p.add_argument("--plan", default="trader/plan.json")

@@ -7,12 +7,14 @@ description: >-
   runs a pre-market scan of daily closes (20-day closing-high breakout, bull
   flag, reclaimed the 20-day average, oversold, oversold bounce) and an
   intraday opening-range breakout scan on 5-minute bars, then writes
-  trader/watchlist.json for trader-news and trader-entry. Free Yahoo data,
+  trader/watchlist.json for trader-news and trader-entry. With --side short it
+  looks for the mirror images (closing-low breakdown, bear flag, lost the
+  20-day average, overbought, overbought reversal, opening-range breakdown). Free Yahoo data,
   bar by bar. Use when the user says "scan the market", "find me setups",
   "what is breaking out", "opening range breakouts", "scan for bull flags",
   "oversold stocks", "pre-market scan", "build my watchlist", "what should I
   look at today", or at the start of a trading day before /trader-news.
-argument-hint: "[universe | daily | orb] [--at HH:MM]"
+argument-hint: "[universe | daily | orb] [--at HH:MM] [--side buy|sell]"
 ---
 
 # trader-scanner
@@ -177,6 +179,24 @@ charts) tags BLK, CI, XOM and HD a 20-day breakout, CCL a bull flag, F, JPM
 and GE a reclaim of the 20-day average, and BAC, MS, RIVN and PLUG oversold,
 as the reel did. On closes it also tags KO (breakout), RCL (flag) and PNC (an
 oversold bounce).
+
+## Short setups
+
+`--side short` (or `sell`) on `daily` and `orb` looks for what a short wants. A short is a bet on a fall, with
+no ceiling on the loss:
+
+| setup | the rule |
+| --- | --- |
+| `breakdown_20d` | the last close is below every close of the 20 before it |
+| `bear_flag` | down more than 10 % over the 10 sessions before the last 5, then the last 5 closes inside a 5 % range |
+| `lost_ma20` | closed over the 20-day average, then closed under it |
+| `overbought` | RSI 14 over 70 |
+| `overbought_reversal` | RSI 14 was over 70 yesterday and today closed down |
+| `orb` (with `--side short`) | the first completed 5-minute bar to CLOSE below the opening-range low |
+
+The watchlist then carries `"side": "sell"`, and `entry.py watchlist` follows it. The scanner only reads the
+Nasdaq Trader stock list: it does not scan futures, forex or crypto. For those, give `entry.py` the symbol
+directly (`--market 24h`).
 
 ## Rules
 

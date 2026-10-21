@@ -8,8 +8,9 @@ description: >-
   meet your minimum, the day's total risk must fit your daily loss limit, no
   more than your trades per day, and no new entries outside your entry
   window or when the market is closed. It also keeps the basics: blocked
-  tickers, order size, position cap, cash buffer, margin, short sales,
-  options and crypto, malformed or bad bracket orders, duplicates and a daily
+  tickers, order size, position cap, cash buffer, margin, short sales (off
+  until "allow_short"), 24h markets and leverage (off until "allow_24h" and
+  "allow_margin"), options and crypto, malformed or bad bracket orders, duplicates and a daily
   order limit. Getting out is never blocked by a day limit. Prints PASS or
   BLOCK with the reason and records the verdicts so trader-broker only shows
   an order that passed. Use when the user says "check my order", "is this
@@ -101,6 +102,25 @@ How the numbers work:
 Warnings do not block, but say them to the user: a LIVE account, a number
 sent as a number instead of a string, a stop that lives only in the plan and
 not at the broker, a price too old to use, an early close today.
+
+## Short side, 24h markets and leverage
+
+All three are off until the config turns them on, and the user confirms.
+
+- **Short** (`"allow_short": true`). A sell that goes short is an entry. Its stop must be ABOVE the entry and
+  its target below. The loss is measured from the LOWER of the plan's entry and a fresh price (a price that
+  fell since the plan is a bigger loss at the same stop). It ties up margin: the notional / leverage must
+  fit in cash after the buffer unless `"allow_margin"` is true. Buying back what you are short is an exit
+  and is never blocked by a day limit.
+- **24h markets** (`"allow_24h": true`). An order whose plan says `"market": "24h"` (gold futures, forex,
+  crypto) is blocked as an asset otherwise. With it on, the symbol may look like `GC=F`, `EURUSD=X` or
+  `BTC-USD`, a bracket may carry fractional units, and the entry window is the plan's own session (no
+  entries in the last 30 minutes, or between `no_entries_before_24h` and `no_entries_after_24h` in the
+  config), not the NYSE hours. There is no holiday calendar for these markets, and the order is a ticket for
+  your own broker: Alpaca's stock tool does not trade it.
+- **Leverage** (`"leverage": 500`, needs `"allow_margin": true`). The max order, position cap and cash checks
+  count the margin (notional / leverage). Your money settings are in your account currency: `fx_rate` converts
+  them, and `max_loss_per_trade_pct` makes the per-trade limit a percent of the budget.
 
 ## Steps
 
