@@ -452,3 +452,159 @@ class Cli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+GOLD_PLAN = {"symbol": "GC=F", "side": "sell", "date": "2026-10-21", "entry": 4144.90, "stop": 4151.55,
+             "target": 4131.60, "flat_by": "16:55", "market": "24h",
+             "session": {"kind": "24h", "open": "08:20", "close": "17:00", "weekends": False}}
+SHORT_PLAN = {"symbol": "TSLA", "side": "sell", "date": "2026-10-19", "entry": 364.18, "stop": 370.04,
+              "target": 352.46, "flat_by": "15:55"}
+
+
+def quote(sym, price):
+    return {sym: {"price": price, "prev_close": price, "source": "test"}}
+
+
+class ShortRules(unittest.TestCase):
+    def rules(self, plan=SHORT_PLAN):
+        return alerts.rules_from_plan(plan)
+
+    def test_a_short_plan_makes_mirrored_rules(self):
+        stop, target, flat = self.rules()
+        self.assertEqual((stop["type"], stop["side"], stop["price"]), ("stop", "sell", 370.04))
+        self.assertEqual((target["type"], target["side"], target["price"]), ("target", "sell", 352.46))
+        self.assertEqual((flat["type"], flat["side"], flat["before_close"]), ("time", "sell", True))
+
+    def test_the_stop_rings_above_and_the_target_below(self):
+        status = alerts.market_status(ny("2026-10-19 11:00"))
+        rules = self.rules()
+        rings, _ = alerts.evaluate(rules, quote("TSLA", 369.99), status, {}, ny("2026-10-19 11:00"))
+        self.assertEqual(rings, [])                                          # not at the stop yet
+        rings, st = alerts.evaluate(rules, quote("TSLA", 370.10), status, {}, ny("2026-10-19 11:00"))
+        self.assertEqual([r["id"] for r in rings], ["tsla-plan-stop"])
+        self.assertIn("at or above your stop $370.04", rings[0]["message"])
+        rings, _ = alerts.evaluate(rules, quote("TSLA", 352.40), status, {}, ny("2026-10-19 11:00"))
+        self.assertEqual([r["id"] for r in rings], ["tsla-plan-target"])
+        self.assertIn("at or below your target $352.46", rings[0]["message"])
+        self.assertEqual(alerts.evaluate(rules, quote("TSLA", 365.0), status, {}, ny("2026-10-19 11:00"))[0], [])
+
+    def test_a_long_plan_is_unchanged(self):
+        stop = [r for r in plan_rules() if r["type"] == "stop"][0]
+        self.assertNotIn("side", stop)
+        status = alerts.market_status(ny("2026-10-19 11:00"))
+        rings, _ = alerts.evaluate([stop], quote("TSLA", 358.0), status, {}, ny("2026-10-19 11:00"))
+        self.assertIn("at or below your stop", rings[0]["message"])
+
+    def test_flat_by_for_a_short_says_buy_to_cover(self):
+        flat = self.rules()[2]
+        status = alerts.market_status(ny("2026-10-19 15:56"))
+        rings, _ = alerts.evaluate([flat], {}, status, {}, ny("2026-10-19 15:56"))
+        self.assertIn("buy-to-cover ticket", rings[0]["message"])
+
+    def test_cli_add_stop_side_sell(self):
+        with tempfile.TemporaryDirectory() as d:
+            rules = os.path.join(d, "alerts.json")
+            code, out, _ = run(["add", "--rules", rules, "--state", os.path.join(d, "s.json"), "--symbol", "TSLA",
+                                "--stop", "370.04", "--side", "sell"])
+            self.assertEqual(code, 0)
+            self.assertEqual(json.load(open(rules))["rules"][0]["side"], "sell")
+            code, _, err = run(["add", "--rules", rules, "--symbol", "TSLA", "--above", "380", "--side", "sell"])
+            self.assertEqual(code, 1)
+            self.assertIn("--side sell is for --stop and --target", err)
+
+
+class Gold24h(unittest.TestCase):
+    def rules(self):
+        return alerts.rules_from_plan(GOLD_PLAN)
+
+    def test_the_plan_carries_its_session(self):
+        stop, target, flat = self.rules()
+        for r in (stop, target, flat):
+            self.assertEqual((r["market"], r["date"], r["session"]["open"], r["session"]["close"]),
+                             ("24h", "2026-10-21", "08:20", "17:00"))
+        self.assertEqual((flat["at"], flat["side"]), ("16:55", "sell"))
+        self.assertNotIn("before_close", flat)
+        with self.assertRaises(alerts.AlertError):
+            alerts.rules_from_plan(dict(GOLD_PLAN, date=None))
+
+    def test_rules_are_watched_inside_the_session_and_not_after_a_while(self):
+        r = self.rules()[0]
+        for when, on in (("2026-10-21 07:00", False), ("2026-10-21 07:30", True), ("2026-10-21 12:00", True),
+                         ("2026-10-21 23:30", True), ("2026-10-22 06:00", False)):
+            self.assertEqual(alerts.rule_active(r, "x", alerts.to_eastern(ny(when))), on, when)
+
+    def test_a_gold_short_stop_and_target_ring_without_the_nyse_being_open(self):
+        rules = self.rules()
+        now = ny("2026-10-21 17:20")                                    # NYSE closed, but 24h rules still count
+        status = alerts.market_status(now)
+        self.assertFalse(status["open"])
+        rings, _ = alerts.evaluate(rules, quote("GC=F", 4152.0), status, {}, now)
+        self.assertEqual([x["id"] for x in rings if x["symbol"]][0], "gc=f-plan-stop")
+        self.assertTrue(any("flat by close" in x["message"].lower() for x in rings))
+
+    def test_flat_by_rings_once_inside_the_session(self):
+        flat = self.rules()[2]
+        st = alerts.market_status(ny("2026-10-21 16:50"))
+        rings, state = alerts.evaluate([flat], {}, st, {}, ny("2026-10-21 16:50"))
+        self.assertEqual(rings, [])
+        rings, state = alerts.evaluate([flat], {}, st, state, ny("2026-10-21 16:56"))
+        self.assertEqual(len(rings), 1)
+        self.assertIn("the session ends at 17:00", rings[0]["message"])
+        self.assertIn("buy-to-cover", rings[0]["message"])
+        rings, _ = alerts.evaluate([flat], {}, st, state, ny("2026-10-21 16:58"))
+        self.assertEqual(rings, [])                                      # once
+
+    def test_an_overnight_session_flat_by_after_midnight(self):
+        plan = dict(GOLD_PLAN, date="2026-10-20", flat_by="04:55", session={"kind": "24h", "open": "22:00",
+                                                                           "close": "05:00", "weekends": False})
+        flat = alerts.rules_from_plan(plan)[2]
+        st = alerts.market_status(ny("2026-10-21 04:56"))
+        rings, _ = alerts.evaluate([flat], {}, st, {}, ny("2026-10-21 04:56"))     # the next calendar day
+        self.assertEqual(len(rings), 1)
+        rings, _ = alerts.evaluate([flat], {}, st, {}, ny("2026-10-20 23:00"))
+        self.assertEqual(rings, [])
+
+    def test_clock_for_a_24h_session(self):
+        st = alerts.market_status24(ny("2026-10-21 12:00"), "08:20", "17:00")
+        self.assertTrue(st["open"])
+        st = alerts.market_status24(ny("2026-10-21 18:00"), "08:20", "17:00")
+        self.assertFalse(st["open"])
+        self.assertEqual(st["next_open"], "2026-10-22 08:20")
+        st = alerts.market_status24(ny("2026-10-23 18:00"), "08:20", "17:00")           # Friday evening
+        self.assertEqual(st["next_open"], "2026-10-26 08:20")
+        self.assertIn("weekend", st["reason"])
+        st = alerts.market_status24(ny("2026-10-24 12:00"), "08:20", "17:00", weekends=True)
+        self.assertTrue(st["open"])
+        st = alerts.market_status24(ny("2026-10-21 02:00"), "22:00", "05:00")           # Tue's overnight session
+        self.assertTrue(st["open"])
+        self.assertEqual(st["session_date"], "2026-10-20")
+        with self.assertRaises(alerts.AlertError):
+            alerts.market_status24(ny("2026-10-21 12:00"), "8:2x", "17:00")
+
+    def test_cli_clock_and_check(self):
+        code, out, _ = run(["clock", "--market", "24h", "--now", "2026-10-21 12:00"])
+        self.assertEqual(code, 0)
+        self.assertIn("24h session 08:20 to 17:00 is OPEN", out)
+        code, out, _ = run(["clock", "--market", "24h", "--now", "2026-10-21 18:00", "--json"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out)["next_open"], "2026-10-22 08:20")
+        with tempfile.TemporaryDirectory() as d:
+            rules = os.path.join(d, "alerts.json")
+            plan = os.path.join(d, "plan.json")
+            with open(plan, "w") as fh:
+                json.dump(GOLD_PLAN, fh)
+            code, out, _ = run(["add", "--from-plan", "--plan", plan, "--rules", rules,
+                                "--state", os.path.join(d, "s.json"), "--config", os.path.join(d, "none")])
+            self.assertEqual(code, 0)
+            self.assertEqual(len(json.load(open(rules))["rules"]), 3)
+            qdir = os.path.join(d, "q")
+            os.mkdir(qdir)
+            with open(os.path.join(qdir, "yahoo-GC=F.json"), "w") as fh:
+                json.dump({"chart": {"result": [{"meta": {"symbol": "GC=F", "regularMarketPrice": 4152.0,
+                                                         "chartPreviousClose": 4140.0, "regularMarketTime": 1792591200,
+                                                         "currency": "USD"}}], "error": None}}, fh)
+            code, out, err = run(["check", "--rules", rules, "--state", os.path.join(d, "s.json"), "--offline", qdir,
+                                  "--prices-out", os.path.join(d, "p.json"), "--now", "2026-10-21 12:00"])
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("ALERT GC=F is $4152.00: at or above your stop $4151.55", out)
+            self.assertIn("24h-market rules are watched by their own session", out)
