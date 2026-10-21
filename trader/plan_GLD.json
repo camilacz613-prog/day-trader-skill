@@ -1,0 +1,28 @@
+{
+  "created_by": "trader-exit",
+  "symbol": "GLD",
+  "side": "buy",
+  "date": "2026-10-21",
+  "setup": "orb",
+  "entry": 379.36,
+  "entry_time": "11:30 AM",
+  "entry_bar": 23,
+  "interval": "5m",
+  "opening_range": {
+    "high": 379.32,
+    "low": 378.72,
+    "minutes": 15
+  },
+  "stop": 379.02,
+  "stop_rule": "or_mid",
+  "stop_label": "opening-range midpoint",
+  "target": 380.04,
+  "target_r": 2.0,
+  "target_label": "2R (two times the risk)",
+  "risk_per_share": 0.34,
+  "reward_risk": 2.0,
+  "flat_by": "15:55",
+  "stop_detail": "($379.32 + $378.72) / 2 = $379.02",
+  "created_at": "2026-10-21T21:30:25Z",
+  "note": "A stop is a plan, not a guarantee: a gap or a fast market can fill past it."
+}
