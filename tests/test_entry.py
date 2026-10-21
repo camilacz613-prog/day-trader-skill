@@ -530,10 +530,10 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("holds TSLA, not NVDA", err)
 
-    def test_longs_only_and_flag_errors(self):
-        code, _, err = run(["check", "TSLA", "--offline", TSLA, "--side", "short"])
+    def test_flag_errors(self):
+        code, _, err = run(["check", "TSLA", "--offline", TSLA, "--market", "24h", "--anchor", "25:00"])
         self.assertEqual(code, 1)
-        self.assertIn("v2 plans longs only", err)
+        self.assertIn("--anchor wants a New York time", err)
         code, _, err = run(["check", "TSLA", "--offline", TSLA, "--level", "300"])
         self.assertIn("--level is for --setup level", err)
         code, _, err = run(["check", "TSLA", "--offline", TSLA, "--setup", "level"])
@@ -603,3 +603,152 @@ class SkillDoc(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def synth(open_utc, rows, sym="GC=F", step=300, now_extra=0):
+    """SYNTHETIC chart JSON (not market data): rows are (open, high, low, close, volume) bars
+    that start at open_utc (a datetime in UTC) and run `step` seconds apart."""
+    t0 = int((open_utc - DT(1970, 1, 1)).total_seconds())
+    ts = [t0 + i * step for i in range(len(rows))]
+    q = {k: [r[i] for r in rows] for i, k in enumerate(("open", "high", "low", "close", "volume"))}
+    return {"chart": {"result": [{"meta": {"symbol": sym, "dataGranularity": "5m", "previousClose": rows[0][0],
+                                           "regularMarketTime": ts[-1] + step + now_extra},
+                                  "timestamp": ts, "indicators": {"quote": [q]}}], "error": None}}
+
+
+# Wed 2026-10-21, 08:20 EDT = 12:20 UTC. Range bars 08:20/08:25/08:30: high 101, low 99.
+# 08:35 closes 99.5 (inside), 08:40 closes 98.6 (below the low), 08:45 closes 101.4 (above the high).
+BARS_24H = [(100, 101, 99.5, 100.5, 10), (100.5, 101, 99.2, 99.8, 12), (99.8, 100.4, 99, 100, 11),
+            (100, 100.2, 99.3, 99.5, 9), (99.5, 99.6, 98.4, 98.6, 20), (98.6, 101.6, 98.5, 101.4, 30),
+            (101.4, 101.5, 100.9, 101.0, 8)]
+OPEN_24H = DT(2026, 10, 21, 12, 20)
+M24 = {"anchor": datetime.time(8, 20), "close": datetime.time(17, 0), "weekends": False}
+
+
+class ShortSide(unittest.TestCase):
+    def ev(self, now, side, **kw):
+        c = entry.parse_chart(json.dumps(synth(OPEN_24H, BARS_24H)), "GC=F")
+        return entry.evaluate(c, ny(now), side=side, market=dict(M24, kind="24h"), **kw)
+
+    def test_short_triggers_on_the_close_below_the_range_low(self):
+        r = self.ev("2026-10-21 08:50", "sell")
+        self.assertEqual((r["status"], r["side"]), ("triggered", "sell"))
+        self.assertEqual(r["level"], 99.0)
+        self.assertEqual(r["trigger"]["bar_start"], "08:40")
+        self.assertEqual(r["trigger"]["time"], "8:45 AM")
+        self.assertEqual(r["trigger"]["price"], 98.6)
+        self.assertEqual(r["trigger"]["pct_over"], 0.4)          # 0.4 % beyond the level, in the trade's direction
+        text = "\n".join(entry.describe(r))
+        self.assertIn("closed below the range low $99.00", text)
+        self.assertIn("BEFORE you sell short", text)
+
+    def test_long_on_the_same_bars_waits_for_the_range_high(self):
+        r = self.ev("2026-10-21 08:44", "buy")
+        self.assertEqual(r["status"], "waiting")
+        self.assertEqual(r["level"], 101.0)
+        r = self.ev("2026-10-21 08:50", "buy")
+        self.assertEqual((r["status"], r["trigger"]["bar_start"], r["trigger"]["price"]), ("triggered", "08:45", 101.4))
+
+    def test_a_wick_or_a_close_at_the_low_is_not_a_trigger(self):
+        rows = list(BARS_24H)
+        rows[4] = (99.5, 99.6, 98.0, 99.0, 20)                   # wick under the low, closes AT it
+        c = entry.parse_chart(json.dumps(synth(OPEN_24H, rows)), "GC=F")
+        r = entry.evaluate(c, ny("2026-10-21 08:45"), side="sell", market=dict(M24, kind="24h"))
+        self.assertEqual(r["status"], "waiting")
+
+    def test_waiting_words_for_a_short(self):
+        r = self.ev("2026-10-21 08:39", "sell")
+        self.assertEqual(r["status"], "waiting")
+        self.assertIn("$1.00 over the range low $99.00", r["reason"])
+
+    def test_level_setup_short_and_entry_json(self):
+        r = self.ev("2026-10-21 08:50", "sell", setup="level", level=99.6)
+        self.assertEqual((r["status"], r["trigger"]["bar_start"]), ("triggered", "08:35"))
+        self.assertEqual(entry.entry_doc(r, ny("2026-10-21 08:50"))["side"], "sell")
+        self.assertEqual(entry.entry_doc(r, ny("2026-10-21 08:50"))["market"], "24h")
+
+    def test_cli_accepts_short(self):
+        code, text, err = run(["check", "GC=F", "--offline", _write_tmp(synth(OPEN_24H, BARS_24H)), "--now",
+                               "2026-10-21 08:50", "--side", "short", "--market", "24h", "--anchor", "08:20"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("SHORT", text)
+
+
+def _write_tmp(d):
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(d, fh)
+    return path
+
+
+class Market24h(unittest.TestCase):
+    def ev(self, now, anchor="08:20", close="17:00", weekends=False, **kw):
+        c = entry.parse_chart(json.dumps(synth(OPEN_24H, BARS_24H)), "GC=F")
+        return entry.evaluate(c, ny(now), market=entry.make_market("24h", anchor, close, weekends), **kw)
+
+    def test_the_session_is_the_one_you_name(self):
+        r = self.ev("2026-10-21 08:50")
+        self.assertEqual((r["opens"], r["closes"], r["market"]), ("08:20", "17:00", "24h"))
+        self.assertEqual(r["no_entries_after"], "16:30")          # 30 minutes before the close
+        self.assertEqual(r["opening_range"]["high"], 101.0)
+        self.assertEqual(r["trigger"]["price"], 101.4)
+
+    def test_before_the_anchor_it_is_not_open(self):
+        r = self.ev("2026-10-21 08:00")
+        self.assertEqual((r["status"], r["phase"]), ("waiting", "pre-open"))
+        self.assertIn("the session opens at 8:20", r["reason"])
+
+    def test_after_the_cutoff_it_expires(self):
+        c = entry.parse_chart(json.dumps(synth(OPEN_24H, BARS_24H[:4])), "GC=F")
+        r = entry.evaluate(c, ny("2026-10-21 16:31"), market=entry.make_market("24h", "08:20", "17:00"))
+        self.assertEqual(r["status"], "expired")
+
+    def test_config_sets_the_24h_cutoff(self):
+        cfg = dict(entry.DEFAULTS, no_entries_after_24h="09:00")
+        c = entry.parse_chart(json.dumps(synth(OPEN_24H, BARS_24H[:4])), "GC=F")
+        r = entry.evaluate(c, ny("2026-10-21 09:00"), cfg=cfg, market=entry.make_market("24h", "08:20", "17:00"))
+        self.assertEqual((r["status"], r["no_entries_after"]), ("expired", "09:00"))
+
+    def test_weekend_is_closed_unless_you_ask_for_it(self):
+        sat = entry.make_market("24h", "08:20", "17:00")
+        self.assertFalse(entry.trading_day(datetime.date(2026, 10, 24), sat)[0])
+        self.assertFalse(entry.trading_day(datetime.date(2026, 10, 25), sat)[0])      # Sunday daytime
+        self.assertTrue(entry.trading_day(datetime.date(2026, 10, 26), sat)[0])
+        self.assertTrue(entry.trading_day(datetime.date(2026, 10, 24), entry.make_market("24h", "08:20", "17:00", True))[0])
+        self.assertEqual(entry.next_open(datetime.date(2026, 10, 23), sat), "2026-10-26 08:20")
+
+    def test_an_evening_anchor_wraps_past_midnight(self):
+        m = entry.make_market("24h", "18:00", "17:00")
+        open_dt, close_dt = entry.session_window(datetime.date(2026, 10, 25), m)       # Sunday 18:00
+        self.assertEqual((open_dt, close_dt), (DT(2026, 10, 25, 18, 0), DT(2026, 10, 26, 17, 0)))
+        self.assertTrue(entry.trading_day(datetime.date(2026, 10, 25), m)[0])           # Sunday evening opens the week
+        self.assertFalse(entry.trading_day(datetime.date(2026, 10, 23), m)[0])          # Friday 18:00 is after the close
+        # at 02:00 Monday the session that began Sunday is the one running
+        self.assertEqual(entry.session_day(DT(2026, 10, 26, 2, 0), m), datetime.date(2026, 10, 25))
+        self.assertEqual(entry.session_day(DT(2026, 10, 26, 17, 30), m), datetime.date(2026, 10, 26))
+
+    def test_wrapped_session_finds_its_bars_after_midnight(self):
+        # anchor 22:00 ET Tue 2026-10-20 (02:00 UTC Wed); close 05:00 next day
+        rows = [(100, 101, 99.5, 100.5, 10)] * 3 + [(100.5, 100.8, 100.4, 100.6, 9), (100.6, 102, 100.5, 101.8, 30)]
+        c = entry.parse_chart(json.dumps(synth(DT(2026, 10, 21, 2, 0), rows)), "GC=F")
+        m = entry.make_market("24h", "22:00", "05:00")
+        r = entry.evaluate(c, ny("2026-10-20 23:30"), market=m)
+        self.assertEqual((r["date"], r["status"], r["trigger"]["bar_start"]), ("2026-10-20", "triggered", "22:20"))
+        r = entry.evaluate(c, ny("2026-10-21 00:30"), market=m)                          # after midnight: same session
+        self.assertEqual(r["date"], "2026-10-20")
+
+    def test_chart_range_covers_an_evening_start(self):
+        today = datetime.date(2026, 10, 21)
+        self.assertEqual(entry.chart_range(today, today, "5m", entry.make_market("24h")), "5d")
+        self.assertEqual(entry.chart_range(today, today, "5m"), "1d")
+
+    def test_watch_replays_a_24h_session(self):
+        lines = []
+        c = entry.parse_chart(json.dumps(synth(OPEN_24H, BARS_24H)), "GC=F")
+        clock = entry.SimClock(ny("2026-10-21 08:20"))
+        opts = {"setup": "orb", "or_minutes": 15, "interval": "5m", "level": None, "min_volume_x": None,
+                "cfg": dict(entry.DEFAULTS), "side": "sell", "market": entry.make_market("24h", "08:20", "17:00")}
+        code, res = entry.watch_loop(lambda now: c, clock.now, clock.sleep, lines.append, opts, every=30)
+        self.assertEqual(code, 0)
+        self.assertEqual(res["trigger"]["bar_start"], "08:40")
+        self.assertTrue(any("TRIGGERED" in l for l in lines))

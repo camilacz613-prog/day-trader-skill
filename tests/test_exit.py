@@ -37,10 +37,10 @@ def run(mod, argv):
     return code, out.getvalue(), err.getvalue()
 
 
-def c(entry_px, stop, target="2R", oh=362.18, ol=354.47, atr=None, n=None):
+def c(entry_px, stop, target="2R", oh=362.18, ol=354.47, atr=None, n=None, side="buy"):
     sr, sp = exitp.parse_stop(stop)
     tr, tp = exitp.parse_target(target)
-    return exitp.compute(entry_px, sr, sp, tr, tp, oh, ol, atr, n)
+    return exitp.compute(entry_px, sr, sp, tr, tp, oh, ol, atr, n, side)
 
 
 class Math(unittest.TestCase):
@@ -220,12 +220,10 @@ class Cli(unittest.TestCase):
         self.assertEqual(self.plan("--stop", "pct:1")[0], 0)
 
         code, _, err = self.plan("--side", "sell")
-        self.assertIn("v2 plans longs only", err)
-        self.write(os.path.join("trader", "entry.json"), dict(REEL_ENTRY, side="sell"))
+        self.assertIn("is a buy but --side says sell", err)
+        self.write(os.path.join("trader", "entry.json"), dict(REEL_ENTRY, side="sideways"))
         code, _, err = self.plan()
-        self.assertIn("longs only", err)
-        code, _, err = self.plan("--stop", "price:364.10")
-        self.assertIn("longs only", err)
+        self.assertIn("buy or sell", err)
         os.remove(os.path.join("trader", "entry.json"))
         code, _, err = self.plan()
         self.assertIn("no entry", err)
@@ -288,3 +286,136 @@ class SkillDoc(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+GOLD_ENTRY = {"created_by": "trader-entry", "symbol": "GC=F", "setup": "orb", "side": "sell", "market": "24h",
+              "session": {"kind": "24h", "open": "08:20", "close": "17:00", "weekends": False},
+              "date": "2026-10-21", "status": "triggered", "time": "8:45 AM", "bar_start": "08:40", "bar_index": 4,
+              "price": 98.6, "level": 99.0, "interval": "5m",
+              "opening_range": {"high": 101.0, "low": 99.0, "minutes": 15},
+              "source": "yahoo", "checked_at": "2026-10-21T12:50:00Z"}
+
+
+class ShortMath(unittest.TestCase):
+    def test_short_stop_is_above_and_rounds_up(self):
+        p = c(98.60, "or-mid", "2R", oh=101.0, ol=99.0, side="sell")
+        self.assertEqual((p["stop"], p["risk"], p["target"], p["reward_risk"]),
+                         (Decimal("100.00"), Decimal("1.40"), Decimal("95.80"), Decimal("2.00")))
+        p = c(98.60, "or-mid", "1R", oh=101.01, ol=99.0, side="sell")      # midpoint 100.005
+        self.assertEqual(p["stop"], Decimal("100.01"))
+        self.assertIn("rounded up", p["stop_detail"])
+        self.assertEqual(p["target"], Decimal("97.19"))                    # 98.60 - 1.41
+
+    def test_or_high_pct_and_price_stops(self):
+        self.assertEqual(c(98.60, "or-high", oh=101.0, ol=99.0, side="sell")["stop"], Decimal("101.00"))
+        p = c(98.60, "pct:1", side="sell")
+        self.assertEqual(p["stop"], Decimal("99.59"))                      # 98.60 x 1.01 = 99.586, up
+        self.assertEqual(p["stop_label"], "1% above the entry")
+        self.assertEqual(c(98.60, "price:99.50", "price:97.00", side="sell")["reward_risk"], Decimal("1.78"))
+
+    def test_atr_stop_is_above_a_short(self):
+        p = c(364.18, "atr:1.5", atr=2.0, n=14, side="sell")
+        self.assertEqual(p["stop"], Decimal("367.18"))
+        self.assertIn("above the entry", p["stop_label"])
+
+    def test_wrong_side_refusals(self):
+        with self.assertRaises(exitp.PlanError) as cm:
+            c(98.60, "price:98.00", side="sell")
+        self.assertIn("a short's stop goes above the entry", str(cm.exception))
+        with self.assertRaises(exitp.PlanError) as cm:
+            c(98.60, "price:99.50", "price:99.00", side="sell")
+        self.assertIn("a short's target goes below it", str(cm.exception))
+        with self.assertRaises(exitp.PlanError) as cm:
+            c(10.00, "price:16.00", "2R", side="sell")                       # 10 - 2 x 6 is below $0
+        self.assertIn("cannot make more than the whole price", str(cm.exception))
+        with self.assertRaises(exitp.PlanError) as cm:
+            c(98.60, "price:98.62", side="sell")
+        self.assertIn("too tight", str(cm.exception))
+        with self.assertRaises(exitp.PlanError) as cm:
+            c(98.60, "price:99.50", "price:97.00", side="buy")
+        self.assertIn("long's stop goes under", str(cm.exception))
+
+
+class ShortAnd24hCli(unittest.TestCase):
+    def setUp(self):
+        self.old = os.getcwd()
+        self.tmp = tempfile.mkdtemp()
+        os.chdir(self.tmp)
+        os.mkdir("trader")
+
+    def tearDown(self):
+        os.chdir(self.old)
+        shutil.rmtree(self.tmp)
+
+    def write(self, name, doc):
+        with open(os.path.join("trader", name), "w") as fh:
+            json.dump(doc, fh)
+
+    def plan(self, *extra):
+        return run(exitp, ["plan", "--now", "2026-10-21 08:50", "--json"] + list(extra))
+
+    def test_a_24h_short_entry_makes_a_short_plan(self):
+        self.write("entry.json", GOLD_ENTRY)
+        code, text, err = self.plan()
+        self.assertEqual((code, err), (0, ""))
+        p = json.loads(text)
+        self.assertEqual((p["side"], p["market"], p["stop"], p["target"]), ("sell", "24h", 100.0, 95.8))
+        self.assertEqual(p["session"], {"kind": "24h", "open": "08:20", "close": "17:00", "weekends": False})
+        self.assertEqual(p["flat_by"], "16:55")                               # 5 minutes before the close
+        self.assertEqual(p["entry_time"], "8:45 AM")
+        code, text, _ = run(exitp, ["plan", "--now", "2026-10-21 08:50"])
+        self.assertIn("GC=F short", text)
+        self.assertIn("Flat by       16:55 ET, win or lose (session 08:20 to 17:00 ET, 24h market)", text)
+        self.assertIn("A short has no ceiling", text)
+        self.assertIn("Risk a unit", text)
+
+    def test_flat_by_for_24h(self):
+        self.write("entry.json", GOLD_ENTRY)
+        self.assertEqual(json.loads(self.plan("--flat-by", "15:00")[1])["flat_by"], "15:00")
+        code, _, err = self.plan("--flat-by", "17:30")
+        self.assertIn("at or after the session close", err)
+        code, _, err = self.plan("--flat-by", "08:30")
+        self.assertIn("no time left to hold it", err)
+        self.write("config.json", {"flat_by_24h": "16:00", "flat_by": "09:00"})
+        self.assertEqual(json.loads(self.plan()[1])["flat_by"], "16:00")
+
+    def test_an_overnight_session_flattens_after_midnight(self):
+        e = dict(GOLD_ENTRY, session={"kind": "24h", "open": "22:00", "close": "05:00", "weekends": False},
+                 date="2026-10-20", time="10:45 PM", bar_index=9)
+        self.write("entry.json", e)
+        code, text, err = run(exitp, ["plan", "--now", "2026-10-20 22:50", "--json"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(json.loads(text)["flat_by"], "04:55")
+
+    def test_side_flag_must_match_the_entry(self):
+        self.write("entry.json", GOLD_ENTRY)
+        code, _, err = self.plan("--side", "buy")
+        self.assertIn("is a short but --side says buy", err)
+        self.assertEqual(self.plan("--side", "short")[0], 0)
+        code, _, err = self.plan("--stop", "or-low")
+        self.assertIn("or-low is under a short's entry", err)
+
+    def test_flags_only_short_and_stock_market_mismatch(self):
+        code, text, err = run(exitp, ["plan", "--symbol", "TSLA", "--entry", "364.18", "--or-high", "370",
+                                     "--or-low", "366", "--side", "short", "--now", "2026-10-19 10:15", "--json"])
+        self.assertEqual((code, err), (0, ""))
+        p = json.loads(text)
+        self.assertEqual((p["side"], p["stop"], p["market"]), ("sell", 368.0, "stock"))
+        self.write("entry.json", dict(REEL_ENTRY))
+        code, _, err = run(exitp, ["plan", "--market", "24h", "--now", "2026-10-19 10:15"])
+        self.assertIn("is a stock-hours entry", err)
+
+    def test_atr_for_a_short_uses_the_bars_above_the_entry(self):
+        code, text, err = run(exitp, ["plan", "--symbol", "TSLA", "--entry", "364.18", "--side", "sell", "--setup", "orb",
+                                     "--or-high", "362.18", "--or-low", "354.47", "--time", "10:15 AM",
+                                     "--entry-bar", "8", "--stop", "atr:1", "--offline", TSLA,
+                                     "--date", "2026-10-19", "--now", "2026-10-19 10:15", "--json"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertGreater(json.loads(text)["stop"], 364.18)
+
+    def test_show_a_short_plan(self):
+        self.write("entry.json", GOLD_ENTRY)
+        run(exitp, ["plan", "--now", "2026-10-21 08:50", "--write"])
+        code, text, _ = run(exitp, ["show", "--now", "2026-10-21 08:50"])
+        self.assertEqual(code, 0)
+        self.assertIn("GC=F short", text)
