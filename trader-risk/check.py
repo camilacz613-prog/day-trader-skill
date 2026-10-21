@@ -67,7 +67,8 @@ fractional units, and the entry window is the plan's own session (its "session":
 no entries in the last 30 minutes, or between "no_entries_before_24h" and "no_entries_after_24h")
 instead of the NYSE hours. There is no holiday calendar for these markets.
 
-Leverage and currency. With "leverage" above 1 the max order, position cap and cash checks
+Leverage and currency. "leverage" above 1 is off until you say "allow_margin": true (an entry
+is blocked otherwise). With "leverage" above 1 the max order, position cap and cash checks
 count the margin an order ties up (notional / leverage), like trader-budget. "fx_rate" converts
 the money settings from your account currency into the instrument's, and
 "max_loss_per_trade_pct" makes the per-trade limit a percent of the budget.
@@ -648,6 +649,9 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         # blocked list and size
         if sym in blocked:
             later.append("blocked: %s is on your blocked list" % sym)
+        if lev > 1 and not c.get("allow_margin"):
+            later.append("margin: leverage 1:%g is off (\"allow_margin\": false). Trading on leverage can lose "
+                         "more than you put in" % lev)
         tied = value / lev if value is not None else None      # the margin an order ties up
         if value is not None:
             if value < float(c.get("min_order_usd") or 0) - CENT:

@@ -407,7 +407,7 @@ class ShortAnd24h(unittest.TestCase):
         self.put(GOLD_SHORT)
         code = self.run_risk("2026-10-21 09:00")
         cfg = json.load(open(self.cfg))
-        cfg.update(budget=3000, fx_rate=1.1236, max_loss_per_trade_pct=1, leverage=500)
+        cfg.update(budget=3000, fx_rate=1.1236, max_loss_per_trade_pct=1, leverage=500, allow_margin=True)
         with open(self.cfg, "w") as fh:
             json.dump(cfg, fh)
         self.assertEqual(self.run_risk("2026-10-21 09:00"), 0)

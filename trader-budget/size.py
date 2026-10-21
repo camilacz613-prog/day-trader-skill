@@ -564,7 +564,8 @@ def plan_report(s, order, notes=()):
             _num(s["budget_account"]), money(s["budget"]), s["fx_rate"]))
     if s.get("leverage", 1) != 1:
         lines.append("Leverage 1:%g: the caps and the cash limit count the margin a unit ties up "
-                     "(price / leverage), not its whole price." % s["leverage"])
+                     "(price / leverage), not its whole price. trader-risk blocks leverage unless the config "
+                     "says \"allow_margin\": true." % s["leverage"])
     lines.append("")
     lines.append("Limits (%s; the smallest one wins):" % ("whole shares" if step == 1 else "units of %g" % step))
     for l in s["limits"]:

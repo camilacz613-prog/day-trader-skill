@@ -540,7 +540,8 @@ def gold_order(**over):
     return o
 
 
-GOLD = dict(budget=3000, fx_rate=1.1236, max_loss_per_trade_pct=1, leverage=500, allow_short=True, allow_24h=True)
+GOLD = dict(budget=3000, fx_rate=1.1236, max_loss_per_trade_pct=1, leverage=500, allow_short=True, allow_24h=True,
+            allow_margin=True)
 GOLD_NOW = "2026-10-21 09:00"
 
 
@@ -661,6 +662,11 @@ class Market24h(unittest.TestCase):
         o["plan"] = {"entry": 4144.90, "stop": 4151.55, "target": 4131.60}
         res = check.check([o], cfg(**GOLD), now=at(GOLD_NOW))
         self.assertIn("stocks and ETFs only", reasons(res))
+
+    def test_leverage_is_off_until_allow_margin(self):
+        res = check.check([gold_order()], cfg(**dict(GOLD, allow_margin=False)), now=at(GOLD_NOW))
+        self.assertEqual(verdicts(res), ["BLOCK"])
+        self.assertIn('leverage 1:500 is off ("allow_margin": false)', reasons(res))
 
     def test_bad_money_settings(self):
         for over, word in ((dict(fx_rate=0), "fx_rate"), (dict(leverage=0.5), "leverage"),

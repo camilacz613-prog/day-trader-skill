@@ -1014,6 +1014,8 @@ def cmd_watchlist(a):
             doc = json.load(fh)
     except ValueError as e:
         raise EntryError("%s is not valid JSON: %s" % (a.watchlist, e))
+    if a.side is None and str(doc.get("side") or "").lower() == "sell":
+        opts = dict(opts, side="sell")                  # the scan was for shorts
     hits = [h for h in (doc.get("hits") or []) if isinstance(h, dict) and h.get("symbol")]
     if not hits:
         raise EntryError("no hits in %s: the scanner found nothing to watch" % a.watchlist)
@@ -1067,8 +1069,9 @@ def main(argv=None):
         p.add_argument("--interval", choices=["5m", "1m"], default="5m")
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
         p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")
-        p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"],
-                       help="buy/long (default) or sell/short: a close below the level")
+        p.add_argument("--side", default=None, choices=["buy", "long", "sell", "short"],
+                       help="buy/long (default) or sell/short: a close below the level "
+                            "(watchlist: the scanner's side)")
         p.add_argument("--market", default="stock", choices=["stock", "24h"],
                        help="stock = NYSE hours (default); 24h = a session you name (futures, forex, crypto)")
         p.add_argument("--anchor", help="24h: where the opening range starts, New York HH:MM (default 08:20)")

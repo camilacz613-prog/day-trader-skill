@@ -644,3 +644,117 @@ class Cli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def daily_series(closes, last_day="2026-10-19"):
+    """SYNTHETIC daily closes (not market data) ending on last_day, one bar per weekday."""
+    day = D.fromisoformat(last_day)
+    days = []
+    while len(days) < len(closes):
+        if day.weekday() < 5:
+            days.append(day)
+        day -= datetime.timedelta(days=1)
+    days.reverse()
+    return {"t": [ts(d.isoformat() + " 16:00") for d in days], "c": list(closes), "h": None, "l": None, "o": None,
+            "v": None, "meta": {"regularMarketPrice": closes[-1], "regularMarketVolume": 5000000}}
+
+
+FLAT = [100.0 + (0.3 if i % 2 else -0.3) for i in range(40)]
+
+
+class ShortSetups(unittest.TestCase):
+    def tags(self, closes, side="sell"):
+        return scan.find_setups(closes, side)[0]
+
+    def test_a_breakdown_closes_under_every_close_of_the_last_20(self):
+        c = FLAT[:-1] + [98.0]
+        self.assertEqual(self.tags(c), ["breakdown_20d"])
+        self.assertEqual(self.tags(c, "buy"), [])
+        self.assertEqual(self.tags(FLAT[:-1] + [99.7]), [])         # equal to the 20-day low is not under it
+
+    def test_a_bear_flag_is_a_drop_then_a_tight_range(self):
+        c = [100.0] * 24 + [100 - i * 1.5 for i in range(1, 12)] + [83.4, 83.2, 83.5, 83.3, 83.4]
+        self.assertIn("bear_flag", self.tags(c))
+        self.assertNotIn("bull_flag", self.tags(c, "buy"))
+
+    def test_lost_the_20_day_average(self):
+        c = [100.0 + i * 0.2 for i in range(39)] + [101.0]            # rising, then a dip under the average
+        tags = self.tags(c)
+        self.assertIn("lost_ma20", tags)
+        self.assertNotIn("lost_ma20", self.tags([100.0 + i * 0.2 for i in range(40)]))
+
+    def test_overbought_and_the_reversal(self):
+        up = [100.0 + i for i in range(40)]
+        self.assertEqual(self.tags(up), ["overbought"])
+        self.assertIn("overbought_reversal", self.tags(up[:-1] + [up[-2] - 0.5]))
+        self.assertEqual(self.tags(up, "buy"), ["breakout_20d"])
+
+    def test_scan_daily_for_shorts_and_the_watchlist_side(self):
+        data = {"DOWN": daily_series(FLAT[:-1] + [98.0]), "UP": daily_series(FLAT[:-1] + [102.0])}
+        now = DT(2026, 10, 19, 21, 0)
+        hits, counts, _ = scan.scan_daily(data, ["DOWN", "UP"], now, 5, 1000000, "sell")
+        self.assertEqual([h["symbol"] for h in hits], ["DOWN"])
+        self.assertEqual(hits[0]["setups"], ["breakdown_20d"])
+        hits, _, _ = scan.scan_daily(data, ["DOWN", "UP"], now, 5, 1000000, "buy")
+        self.assertEqual([h["symbol"] for h in hits], ["UP"])
+
+    def test_cli_daily_short_writes_side_sell(self):
+        d = tempfile.mkdtemp()
+        try:
+            spark = os.path.join(d, "spark.json")
+            data = {"DOWN": daily_series(FLAT[:-1] + [98.0])}
+            # a spark answer: {"spark": {"result": [{"symbol", "response": [{"meta", "timestamp", "indicators"}]}]}}
+            doc = {"spark": {"result": [{"symbol": "DOWN", "response": [{
+                "meta": data["DOWN"]["meta"], "timestamp": data["DOWN"]["t"],
+                "indicators": {"quote": [{"close": data["DOWN"]["c"]}]}}]}], "error": None}}
+            with open(spark, "w") as fh:
+                json.dump(doc, fh)
+            out = os.path.join(d, "watchlist.json")
+            code, text, err = run(["daily", "--offline", spark, "--side", "short", "--out", out, "--quiet",
+                                   "--now", "2026-10-19 17:00"])
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("20-day closing-low breakdown", text)
+            self.assertIn("setups for a short", text)
+            self.assertIn("entry.py --side sell", text)
+            wl = json.load(open(out))
+            self.assertEqual((wl["side"], wl["hits"][0]["symbol"]), ("sell", "DOWN"))
+            code, text, _ = run(["daily", "--offline", spark, "--out", out, "--quiet", "--now", "2026-10-19 17:00"])
+            self.assertEqual(code, 1)                                    # as a long scan nothing matches
+            self.assertNotIn("side", json.load(open(out)))
+        finally:
+            shutil.rmtree(d)
+
+
+class ShortOrb(unittest.TestCase):
+    DAY = "2026-10-19"
+
+    def bars(self, closes, lows=None):
+        return bars_series(self.DAY, closes, lows=lows)
+
+    def test_a_short_orb_needs_a_close_under_the_range_low(self):
+        # range 9:30-9:45 (3 bars) lows 99.9 / 99.4 / 99.6, then 99.5, 99.3 (< 99.4 low), 99.0
+        closes = [100.0, 99.5, 99.7, 99.5, 99.3, 99.0]
+        lows = [99.9, 99.4, 99.6, 99.4, 99.2, 98.9]
+        bars = scan.session_bars(self.bars(closes, lows=lows), D.fromisoformat(self.DAY), DT(2026, 10, 19, 10, 0))
+        self.assertTrue(scan.orb_candidate(bars, 3, "sell"))
+        self.assertFalse(scan.orb_candidate(bars, 3, "buy"))
+        h = scan.orb_hit(bars, 3, "sell")
+        self.assertEqual((h["price"], h["at"], h["bar_start"], h["or_low"]), (99.3, "9:55 AM", "09:50", 99.4))
+        self.assertLess(h["price"], h["or_low"])
+        self.assertGreater(h["pct_over"], 0)
+        self.assertIsNone(scan.orb_hit(bars, 3, "buy"))
+
+    def test_scan_orb_returns_only_the_short_side_hits(self):
+        down = self.bars([100.0, 99.5, 99.7, 99.5, 98.0, 97.5], lows=[99.9, 99.4, 99.6, 99.4, 97.9, 97.4])
+        up = self.bars([100.0, 100.5, 100.7, 100.5, 102.0, 102.5])
+        cutoff = DT(2026, 10, 19, 10, 0)
+        hits, counts, _ = scan.scan_orb({"DOWN": down, "UP": up}, ["DOWN", "UP"], D.fromisoformat(self.DAY), cutoff, 15,
+                                        side="sell")
+        self.assertEqual([h["symbol"] for h in hits], ["DOWN"])
+        hits, _, _ = scan.scan_orb({"DOWN": down, "UP": up}, ["DOWN", "UP"], D.fromisoformat(self.DAY), cutoff, 15)
+        self.assertEqual([h["symbol"] for h in hits], ["UP"])
+
+    def test_bad_side(self):
+        with self.assertRaises(scan.ScanError):
+            scan.side_of("sideways")
+        self.assertEqual((scan.side_of("short"), scan.side_of("long"), scan.side_of(None)), ("sell", "buy", "buy"))
