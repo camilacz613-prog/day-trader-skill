@@ -1,0 +1,28 @@
+{
+  "created_by": "trader-exit",
+  "symbol": "GC=F",
+  "side": "buy",
+  "date": "2026-10-21",
+  "setup": "orb",
+  "entry": 4157.4,
+  "entry_time": "11:30 AM",
+  "entry_bar": 23,
+  "interval": "5m",
+  "opening_range": {
+    "high": 4157.1,
+    "low": 4150.6,
+    "minutes": 15
+  },
+  "stop": 4153.85,
+  "stop_rule": "or_mid",
+  "stop_label": "opening-range midpoint",
+  "target": 4164.5,
+  "target_r": 2.0,
+  "target_label": "2R (two times the risk)",
+  "risk_per_share": 3.55,
+  "reward_risk": 2.0,
+  "flat_by": "15:55",
+  "stop_detail": "($4,157.10 + $4,150.60) / 2 = $4153.85",
+  "created_at": "2026-10-21T21:30:26Z",
+  "note": "A stop is a plan, not a guarantee: a gap or a fast market can fill past it."
+}
