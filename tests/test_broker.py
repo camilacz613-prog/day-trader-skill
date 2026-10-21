@@ -305,3 +305,155 @@ class Flow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SHORT_TSLA = {"symbol": "TSLA", "side": "sell", "qty": "8", "type": "market", "time_in_force": "day",
+              "order_class": "bracket", "take_profit_limit_price": "352.46", "stop_loss_stop_price": "370.04",
+              "plan": {"entry": 364.18, "stop": 370.04, "target": 352.46}}
+GOLD_SHORT = {"symbol": "GC=F", "side": "sell", "qty": "5.06", "type": "market", "time_in_force": "day",
+              "order_class": "bracket", "take_profit_limit_price": "4131.60", "stop_loss_stop_price": "4151.55",
+              "plan": {"entry": 4144.90, "stop": 4151.55, "target": 4131.60, "market": "24h", "flat_by": "16:55",
+                       "session": {"kind": "24h", "open": "08:20", "close": "17:00", "weekends": False},
+                       "leverage": 500, "fx_rate": 1.1236, "notional": 20973.19, "margin": 41.95}}
+
+
+class ShortAnd24h(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.orders = os.path.join(self.d, "orders.json")
+        self.cfg = os.path.join(self.d, "config.json")
+        with open(CFG_PATH) as fh:
+            c = json.load(fh)
+        c.update(allow_short=True, allow_24h=True)
+        with open(self.cfg, "w") as fh:
+            json.dump(c, fh)
+        self.risk = os.path.join(self.d, "state", "risk.json")
+        self.state = os.path.join(self.d, "state", "broker.json")
+        self.pf = os.path.join(self.d, "portfolio.json")
+        self.none = os.path.join(self.d, "none")
+
+    def tearDown(self):
+        shutil.rmtree(self.d)
+
+    def put(self, order):
+        with open(self.orders, "w") as fh:
+            json.dump({"orders": [order]}, fh)
+
+    def args(self, *extra, **kw):
+        return list(extra) + ["--orders", self.orders, "--config", self.cfg, "--risk", self.risk,
+                              "--state", self.state, "--now", kw.get("now", NOW)]
+
+    def run_risk(self, now=NOW):
+        with redirect_stdout(io.StringIO()):
+            return check.main(["--orders", self.orders, "--config", self.cfg, "--portfolio", self.pf,
+                               "--prices", self.none, "--state", self.state, "--now", now, "--out", self.risk])
+
+    def test_a_short_reads_sell_short_and_is_an_entry(self):
+        self.assertTrue(ticket.is_short_entry(SHORT_TSLA))
+        self.assertFalse(ticket.is_short_entry(dict(SHORT_TSLA, stop_loss_stop_price="358.32")))
+        self.assertFalse(ticket.is_short_entry({"symbol": "KO", "side": "sell", "qty": "3"}))
+        self.assertTrue(ticket.plain(SHORT_TSLA).startswith("SELL SHORT 8 TSLA, market, good for today / stop-loss 370.04"))
+        self.assertIn("max loss about $46.88", ticket.plain(SHORT_TSLA))
+        self.assertEqual(ticket.kind_of(SHORT_TSLA, None), "entry")
+
+    def test_the_short_flow_and_its_fill_is_a_negative_position(self):
+        self.put(SHORT_TSLA)
+        self.assertEqual(self.run_risk(), 0)
+        code, text, _ = run(self.args("show", "--index", "1"))
+        self.assertIn("SELL SHORT 8 TSLA", text)
+        self.assertIn("READY: trader-risk PASS", text)
+        self.assertEqual(run(self.args("approve", "--index", "1", "--reply", "yes"))[0], 0)
+        code, text, _ = run(self.args("result", "--index", "1", "--status", "placed", "--filled-qty", "8",
+                                      "--filled-price", "364.20", "--portfolio", self.pf))
+        self.assertEqual(code, 0)
+        with open(self.pf) as fh:
+            pf = json.load(fh)
+        self.assertEqual((pf["positions"][0]["shares"], pf["cash"]), (-8, 7913.6))        # the 5,000 start + 2,913.60 sold
+        st = json.load(open(self.state))
+        self.assertEqual(st["orders"][0]["kind"], "entry")
+        # flatten reads the negative position and builds a BUY to cover
+        code, text, _ = run(["flatten", "--symbol", "TSLA", "--orders", self.orders, "--portfolio", self.pf,
+                             "--plan", self.none, "--config", self.cfg, "--now", NOW])
+        self.assertEqual(code, 0)
+        order = json.load(open(self.orders))["orders"][0]
+        self.assertEqual((order["side"], order["qty"]), ("buy", "8"))
+        self.assertIn("covers the TSLA day trade", order["why"])
+        self.assertIn("A buy to cover", text)
+        # a buy to cover is an exit for trader-risk, and recording it flattens the portfolio
+        self.assertEqual(self.run_risk("2026-10-19 16:30"), 0)
+        code, _, _ = run(["fill", "--symbol", "TSLA", "--side", "buy", "--qty", "8", "--price", "360.00",
+                          "--portfolio", self.pf, "--config", self.cfg, "--state", self.state, "--now", NOW])
+        self.assertEqual(code, 0)
+        pf = json.load(open(self.pf))
+        self.assertEqual((pf["positions"], pf["cash"]), ([], 5033.6))                     # +33.60 on the short
+
+    def test_a_short_fill_needs_allow_short(self):
+        with open(self.cfg, "w") as fh:
+            json.dump({"budget": 5000}, fh)
+        code, _, err = run(["fill", "--symbol", "TSLA", "--side", "sell", "--qty", "8", "--price", "364.20",
+                            "--portfolio", self.pf, "--config", self.cfg, "--state", self.state, "--now", NOW])
+        self.assertEqual(code, 1)
+        self.assertIn('needs "allow_short": true', err)
+
+    def test_covering_more_than_the_short_is_refused(self):
+        run(["fill", "--symbol", "TSLA", "--side", "sell", "--qty", "8", "--price", "364.20", "--portfolio", self.pf,
+             "--config", self.cfg, "--state", self.state, "--now", NOW])
+        code, _, err = run(["fill", "--symbol", "TSLA", "--side", "buy", "--qty", "9", "--price", "360", "--portfolio",
+                            self.pf, "--config", self.cfg, "--state", self.state, "--now", NOW])
+        self.assertEqual(code, 1)
+        self.assertIn("covers only the 8", err)
+
+    def test_a_24h_order_is_a_manual_ticket_not_place_stock_order(self):
+        self.put(GOLD_SHORT)
+        code = self.run_risk("2026-10-21 09:00")
+        cfg = json.load(open(self.cfg))
+        cfg.update(budget=3000, fx_rate=1.1236, max_loss_per_trade_pct=1, leverage=500)
+        with open(self.cfg, "w") as fh:
+            json.dump(cfg, fh)
+        self.assertEqual(self.run_risk("2026-10-21 09:00"), 0)
+        code, text, _ = run(self.args("show", "--index", "1", now="2026-10-21 09:00"))
+        self.assertIn("your own broker (manual)", text)
+        self.assertIn("outside Alpaca's stock tool", text)
+        self.assertIn("sell 5.06 GC=F at market, stop-loss 4151.55, take-profit 4131.60", text)
+        self.assertIn("leverage 1:500, about $41.95 of margin for $20,973.19 of exposure", text)
+        self.assertIn("flat by 16:55 New York (session 08:20 to 17:00)", text)
+        self.assertNotIn("Claude will call place_stock_order", text)
+        self.assertNotIn("Allow once", text)
+        code, text, _ = run(self.args("show", "--index", "1", "--json", now="2026-10-21 09:00"))
+        j = json.loads(text)
+        self.assertEqual((j["manual"], j["tool"], j["broker"]), (True, None, "manual"))
+        code, text, _ = run(self.args("approve", "--index", "1", "--reply", "yes", now="2026-10-21 09:00"))
+        self.assertEqual(code, 0)
+        self.assertIn("place it yourself at your own broker", text)
+        self.assertNotIn("place_stock_order", text)
+        code, text, _ = run(self.args("result", "--index", "1", "--status", "placed", "--filled-qty", "5.06",
+                                      "--filled-price", "4144.90", "--portfolio", self.pf, now="2026-10-21 09:01"))
+        self.assertIn("not added to", text)
+        self.assertFalse(os.path.exists(self.pf))
+        self.assertEqual([r["status"] for r in json.load(open(self.state))["orders"]], ["approved", "placed", "filled"])
+
+    def test_manual_broker_in_the_config(self):
+        cfg = json.load(open(self.cfg))
+        cfg["broker"] = "manual"
+        with open(self.cfg, "w") as fh:
+            json.dump(cfg, fh)
+        self.put(tsla())
+        self.run_risk()
+        code, text, _ = run(self.args("show", "--index", "1"))
+        self.assertIn("Your config says \"broker\": \"manual\"", text)
+
+    def test_flatten_a_24h_short_with_its_plan(self):
+        plan = os.path.join(self.d, "plan.json")
+        with open(plan, "w") as fh:
+            json.dump({"symbol": "GC=F", "side": "sell", "flat_by": "16:55", "market": "24h",
+                       "session": {"kind": "24h", "open": "08:20", "close": "17:00", "weekends": False}}, fh)
+        code, text, _ = run(["flatten", "--symbol", "GC=F", "--qty", "5.06", "--orders", self.orders,
+                             "--portfolio", self.pf, "--plan", plan, "--config", self.cfg, "--now", "2026-10-21 16:40"])
+        self.assertEqual(code, 0)
+        o = json.load(open(self.orders))["orders"][0]
+        self.assertEqual((o["side"], o["qty"], o["plan"]["market"]), ("buy", "5.06", "24h"))
+        self.assertIn("flat by 16:55", text)
+        code, _, err = run(["flatten", "--symbol", "GC=F", "--qty", "5.06", "--side", "sell", "--orders", self.orders,
+                            "--portfolio", self.pf, "--plan", plan, "--config", self.cfg, "--now", "2026-10-21 16:40"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.load(open(self.orders))["orders"][0]["side"], "sell")
