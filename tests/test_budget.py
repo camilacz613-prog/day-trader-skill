@@ -208,7 +208,7 @@ class PlanRules(unittest.TestCase):
         for p, word in ((plan(stop=365.0), "not below the entry"),
                         (plan(target=360.0), "already happened"),
                         (plan(target=None), "positive target"),
-                        (plan(side="sell"), "long (buy) day trades only"),
+                        (plan(side="sideways"), "buy or sell"),
                         (plan(symbol=""), "no symbol")):
             with self.assertRaises(size.SizeError) as e:
                 size.size_trade(p, cfg(), today=TODAY)
@@ -372,3 +372,111 @@ class WeightsMode(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def short_plan(**over):
+    p = {"symbol": "TSLA", "side": "sell", "setup": "orb", "date": TODAY, "entry": 364.18, "entry_time": "10:15 AM",
+         "stop": 370.04, "target": 352.46, "stop_label": "opening-range midpoint", "target_label": "2R",
+         "risk_per_share": 5.86, "flat_by": "15:55"}
+    p.update(over)
+    return p
+
+
+GOLD_PLAN = {"symbol": "GC=F", "side": "sell", "setup": "orb", "date": "2026-10-21", "entry": 4144.90, "entry_time": "8:45 AM",
+             "stop": 4151.55, "target": 4131.60, "risk_per_share": 6.65, "flat_by": "16:55", "market": "24h",
+             "session": {"kind": "24h", "open": "08:20", "close": "17:00", "weekends": False}}
+
+
+class ShortSizing(unittest.TestCase):
+    def test_a_short_is_sized_by_the_distance_up_to_the_stop(self):
+        s = size.size_trade(short_plan(), cfg(), today=TODAY)
+        self.assertEqual((s["side"], s["qty"], s["bound_by"], s["risk_per_share"]), ("sell", 8, "max loss", 5.86))
+        self.assertEqual((s["cost"], s["max_loss"]), (2913.44, 46.88))
+        o = size.bracket_order(s)
+        self.assertEqual((o["side"], o["qty"], o["stop_loss_stop_price"], o["take_profit_limit_price"]),
+                         ("sell", "8", "370.04", "352.46"))
+        self.assertIn("short opening-range breakout on TSLA", o["why"])
+        text = size.plan_report(s, o)
+        self.assertIn("TSLA short", text)
+        self.assertIn("stop 370.04 minus entry 364.18", text)
+        self.assertIn("sell short 8 TSLA", text)
+
+    def test_short_with_the_stop_below_or_the_target_above_is_refused(self):
+        with self.assertRaises(size.SizeError) as e:
+            size.size_trade(short_plan(stop=358.0), cfg(), today=TODAY)
+        self.assertIn("a short trade needs its stop above", str(e.exception))
+        with self.assertRaises(size.SizeError) as e:
+            size.size_trade(short_plan(target=366.0), cfg(), today=TODAY)
+        self.assertIn("already happened", str(e.exception))
+
+    def test_a_fresh_price_below_the_entry_makes_a_short_riskier(self):
+        s = size.size_trade(short_plan(), cfg(), price=362.00, today=TODAY)
+        self.assertEqual((s["entry"], s["entry_from"], s["risk_per_share"]), (362.0, "price", 8.04))
+        s = size.size_trade(short_plan(), cfg(), price=366.00, today=TODAY)        # moved toward the stop: not used
+        self.assertEqual(s["entry_from"], "plan")
+
+    def test_cli_short_with_prices(self):
+        with tempfile.TemporaryDirectory() as d:
+            pp, prices = os.path.join(d, "plan.json"), os.path.join(d, "prices.json")
+            with open(pp, "w") as fh:
+                json.dump(short_plan(), fh)
+            with open(prices, "w") as fh:
+                json.dump(prices_doc(362.00, "2026-10-19T14:12:00Z"), fh)
+            code, out, err = run(["--plan", pp, "--config", CFG, "--prices", prices, "--now", NOW])
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("is under the plan's entry 364.18, so the risk is bigger", out)
+
+
+class LeverageAndCurrency(unittest.TestCase):
+    CONF = dict(budget=3000, fx_rate=1.1236, max_loss_per_trade_pct=1, leverage=500, qty_step=0.01,
+                max_position_pct=75, max_order_usd=4000, cash_buffer_pct=10, min_order_usd=5, allow_short=True)
+
+    def test_gold_short_on_3000_eur_at_1_to_500_with_1_percent_risk(self):
+        s = size.size_trade(GOLD_PLAN, cfg(**self.CONF), today="2026-10-21")
+        self.assertEqual(s["max_loss_per_trade_usd"], 33.71)                    # 1 % of 3,000 EUR at 1.1236
+        self.assertEqual((s["qty"], s["bound_by"]), (5.06, "max loss"))         # floor(33.71 / 6.65, 0.01)
+        self.assertEqual(s["max_loss"], 33.65)                                  # 5.06 x 6.65, under the 33.71 limit
+        self.assertLessEqual(s["max_loss"] / 1.1236, 30.0)                      # never more than 30 EUR
+        self.assertEqual(s["cost"], 20973.19)
+        self.assertEqual(s["margin"], 41.95)
+        o = size.bracket_order(s)
+        self.assertEqual((o["side"], o["qty"]), ("sell", "5.06"))
+        self.assertEqual((o["plan"]["leverage"], o["plan"]["market"]), (500, "24h"))
+        text = size.plan_report(s, o)
+        self.assertIn("Budget 3000 in your account currency = $3,370.80 at 1.1236", text)
+        self.assertIn("Leverage 1:500", text)
+        self.assertIn("ties up $41.95 of margin", text)
+        self.assertIn("5.06 units", text)
+        self.assertIn("Alpaca's place_stock_order does not trade it", text)
+
+    def test_the_loss_limit_floors_to_the_step_so_the_percent_is_never_exceeded(self):
+        for entry, stop in ((4144.90, 4151.55), (100.0, 100.37), (4144.90, 4160.01)):
+            plan_ = dict(GOLD_PLAN, entry=entry, stop=stop, target=round(entry - 2 * (stop - entry), 2))
+            s = size.size_trade(plan_, cfg(**self.CONF), today="2026-10-21")
+            self.assertLessEqual(s["max_loss"], 33.71 + 1e-9, (entry, stop))
+
+    def test_leverage_one_with_the_old_keys_is_unchanged(self):
+        s = size.size_trade(plan(), cfg(), today=TODAY)
+        self.assertEqual((s["qty"], s["margin"], s["cost"]), (8, s["cost"], 2913.44))
+        self.assertEqual(s["leverage"], 1)
+
+    def test_a_stop_too_far_for_one_step_is_a_plain_refusal(self):
+        far = dict(GOLD_PLAN, stop=4151.55 + 5000, target=1000.0)
+        s = size.size_trade(far, cfg(**self.CONF), today="2026-10-21")
+        self.assertEqual(s["qty"], 0)
+        self.assertIn("0.01 units risks", s["refusal"])
+        self.assertIsNone(size.bracket_order(s))
+
+    def test_bad_settings(self):
+        for over, word in ((dict(leverage=0.5), "leverage must be 1 or more"),
+                           (dict(fx_rate=0), "fx_rate must be above 0"),
+                           (dict(qty_step=0), "qty_step"),
+                           (dict(max_loss_per_trade_pct=150), "at most 100")):
+            with self.assertRaises(size.SizeError) as e:
+                size.size_trade(GOLD_PLAN, cfg(**dict(self.CONF, **over)), today="2026-10-21")
+            self.assertIn(word, str(e.exception))
+
+    def test_fx_converts_the_money_settings(self):
+        s = size.size_trade(plan(), cfg(fx_rate=2), today=TODAY)       # 5,000 -> $10,000; max loss $50 -> $100
+        self.assertEqual(s["budget"], 10000.0)
+        self.assertEqual(s["max_loss_per_trade_usd"], 100.0)
