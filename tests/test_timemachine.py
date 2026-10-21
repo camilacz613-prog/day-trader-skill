@@ -1,4 +1,5 @@
 import copy
+import datetime
 import gzip
 import hashlib
 import io
@@ -612,3 +613,191 @@ class Cli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- short side and 24h sessions (SYNTHETIC data)
+
+def synth_chart(sym, open_hm, close_hm, last_day, sessions=30, seed=5, weekdays=(0, 1, 2, 3, 4), start=100.0):
+    """SYNTHETIC 5-minute bars (a seeded random walk, not market data) for `sessions` sessions that
+    start on a weekday in `weekdays` and run open_hm to close_hm New York time (a close at or before
+    the open runs into the next morning). Returns Yahoo chart JSON text; last_day is the newest session."""
+    rng = random.Random(seed)
+    oh, om = [int(x) for x in open_hm.split(":")]
+    ch, cm = [int(x) for x in close_hm.split(":")]
+    length = ((ch * 60 + cm) - (oh * 60 + om)) % 1440 or 1440
+    stamps, o, h, l, c, v = [], [], [], [], [], []
+    price = start
+    day = datetime.date.fromisoformat(last_day)
+    days = []
+    while len(days) < sessions:
+        if day.weekday() in weekdays:
+            days.append(day)
+        day -= datetime.timedelta(days=1)
+    for d in reversed(days):
+        t0 = datetime.datetime.combine(d, datetime.time(oh, om))
+        for i in range(length // 5):
+            local = t0 + datetime.timedelta(minutes=5 * i)
+            ts = int((tm.eastern_to_utc(local) - datetime.datetime(1970, 1, 1)).total_seconds())
+            op = price
+            price = price * (1 + rng.gauss(0, 0.0012))
+            stamps.append(ts)
+            o.append(round(op, 2))
+            h.append(round(max(op, price) * (1 + abs(rng.gauss(0, 0.0004))), 2))
+            l.append(round(min(op, price) * (1 - abs(rng.gauss(0, 0.0004))), 2))
+            c.append(round(price, 2))
+            v.append(100 + i)
+    meta = {"symbol": sym, "dataGranularity": "5m", "regularMarketTime": stamps[-1] + 600}
+    return json.dumps({"chart": {"result": [{"meta": meta, "timestamp": stamps,
+                                             "indicators": {"quote": [{"open": o, "high": h, "low": l,
+                                                                      "close": c, "volume": v}]}}],
+                                 "error": None}})
+
+
+def bar_at(text, day, hhmm):
+    """(close, high, low) of the bar that starts at day hhmm (New York)."""
+    doc = json.loads(text)["chart"]["result"][0]
+    h, m = [int(x) for x in hhmm.split(":")]
+    want = int((tm.eastern_to_utc(datetime.datetime.combine(datetime.date.fromisoformat(day), datetime.time(h, m)))
+                - datetime.datetime(1970, 1, 1)).total_seconds())
+    i = doc["timestamp"].index(want)
+    q = doc["indicators"]["quote"][0]
+    return q["close"][i], q["high"][i], q["low"][i]
+
+
+GOLD_DAY = "2026-10-21"                     # a Wednesday
+GOLD_TEXT = synth_chart("GC=F", "08:20", "17:00", GOLD_DAY)
+GOLD_NOW = tm.parse_now("2026-10-21 17:30")
+_e = bar_at(GOLD_TEXT, GOLD_DAY, "08:40")[0]
+GOLD_SHORT = {"created_by": "trader-exit", "symbol": "GC=F", "side": "sell", "date": GOLD_DAY, "setup": "orb",
+              "market": "24h", "session": {"kind": "24h", "open": "08:20", "close": "17:00", "weekends": False},
+              "entry": _e, "entry_time": "8:45 AM", "entry_bar": 4, "interval": "5m",
+              "opening_range": {"high": round(_e * 1.004, 2), "low": round(_e * 1.001, 2), "minutes": 15},
+              "stop": round(_e * 1.004, 2), "stop_rule": "or_mid", "target": round(_e * 0.992, 2), "target_r": 2.0,
+              "risk_per_share": round(_e * 0.004, 2), "reward_risk": 2.0, "flat_by": "16:55"}
+
+
+class ShortSide(unittest.TestCase):
+    def test_short_plan_must_have_the_stop_above_and_target_below(self):
+        with self.assertRaises(tm.TMError) as cm:
+            tm.normalize_plan(dict(PLAN, side="sell"))
+        self.assertIn("a sell needs target < entry < stop", str(cm.exception))
+        p = tm.normalize_plan(dict(PLAN, side="sell", stop=370.04, target=358.32))
+        self.assertEqual((p["side"], p["risk_per_share"], p["target_r"]), ("sell", 5.86, 1.0))
+
+    def test_a_short_replay_is_the_mirror_of_a_long(self):
+        doc = machine(tm.normalize_plan(dict(PLAN, side="sell", stop=370.04, target=358.32)), replays=2000)
+        mc = doc["mc"]
+        self.assertAlmostEqual(mc["p_target"] + mc["p_stop"] + mc["p_neither"], 1.0, places=3)
+        self.assertEqual(doc["plan"]["side"], "sell")
+        text = "\n".join(tm.report(doc))
+        self.assertIn("below the entry", text)
+        self.assertIn("TSLA sell", text)
+
+    def test_cli_takes_short_as_a_side(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.json")
+            with open(path, "w") as fh:
+                fh.write(TEXT)
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = tm.main(["run", "--symbol", "TSLA", "--side", "short", "--date", "2026-10-19",
+                                "--entry", "364.18", "--stop", "370.04", "--target", "358.32",
+                                "--entry-time", "10:15 AM", "--offline", path, "--now", NOW, "--replays", "500"])
+            self.assertEqual((code, err.getvalue()), (0, ""))
+            self.assertIn("TSLA sell", out.getvalue())
+
+
+class Market24h(unittest.TestCase):
+    def test_a_24h_session_has_its_own_bars(self):
+        sess = tm.session_of(GOLD_SHORT)
+        self.assertEqual((sess["kind"], sess["bars"], sess["length"]), ("24h", 104, 520))
+        self.assertEqual(tm.at_slot(sess, 5), 8 * 60 + 20 + 25)
+        self.assertEqual(tm.session_of(PLAN)["bars"], 78)
+
+    def test_plan_normalizes_with_a_session(self):
+        p = tm.normalize_plan(GOLD_SHORT)
+        self.assertEqual((p["market"], p["entry_bar"], p["entry_time"]), ("24h", 4, "8:45 AM"))
+        self.assertEqual(p["session"], {"kind": "24h", "open": "08:20", "close": "17:00"})
+        with self.assertRaises(tm.TMError) as cm:
+            tm.normalize_plan(dict(GOLD_SHORT, entry_time="8:47 AM", entry_bar=None))
+        self.assertIn("5-minute grid", str(cm.exception))
+        with self.assertRaises(tm.TMError):
+            tm.normalize_plan(dict(GOLD_SHORT, entry_time="5:00 PM", entry_bar=None))   # the last bar is the close
+
+    def test_symbols_with_equals_and_dashes_are_allowed(self):
+        for sym in ("GC=F", "EURUSD=X", "BTC-USD", "^GSPC", "BRK.B"):
+            self.assertEqual(tm.normalize_plan(dict(GOLD_SHORT, symbol=sym))["symbol"], sym)
+        with self.assertRaises(tm.TMError):
+            tm.normalize_plan(dict(GOLD_SHORT, symbol="gc f"))
+
+    def test_full_24h_run(self):
+        doc = tm.time_machine(GOLD_TEXT, tm.normalize_plan(GOLD_SHORT), GOLD_NOW, replays=3000)
+        mc = doc["mc"]
+        self.assertEqual(mc["pool_sessions"], 29)                   # 30 sessions, the plan day left out
+        self.assertEqual((mc["until"], mc["bars_left"]), ("17:00", 99))   # bars 5..103
+        self.assertEqual(mc["band_times"][0], "08:45")
+        self.assertAlmostEqual(mc["p_target"] + mc["p_stop"] + mc["p_neither"], 1.0, places=3)
+        self.assertEqual(doc["data"]["dropped"]["outside_hours"], 0)
+        self.assertTrue(doc["history"]["rule"])
+        self.assertEqual(doc["history"]["rule"]["or_minutes"], 15)
+        text = "\n".join(tm.report(doc))
+        self.assertIn("GC=F sell", text)
+        again = tm.time_machine(GOLD_TEXT, tm.normalize_plan(GOLD_SHORT), GOLD_NOW, replays=3000)
+        self.assertEqual(again["mc"]["p_target"], mc["p_target"])      # same seed, same numbers
+
+    def test_until_for_24h_uses_a_24_hour_clock(self):
+        doc = tm.time_machine(GOLD_TEXT, tm.normalize_plan(GOLD_SHORT), GOLD_NOW, replays=500, until="16:55")
+        self.assertEqual(doc["mc"]["until"], "16:55")
+        doc = tm.time_machine(GOLD_TEXT, tm.normalize_plan(GOLD_SHORT), GOLD_NOW, replays=500, until="14:00")
+        self.assertEqual(doc["mc"]["until"], "14:00")
+        with self.assertRaises(tm.TMError) as cm:
+            tm.time_machine(GOLD_TEXT, tm.normalize_plan(GOLD_SHORT), GOLD_NOW, replays=500, until="17:05")
+        self.assertIn("no later than 5:00 PM", str(cm.exception))
+
+    def test_a_session_with_a_gap_is_left_out(self):
+        doc = json.loads(GOLD_TEXT)
+        r = doc["chart"]["result"][0]
+        del_ts = r["timestamp"][500]                                  # one bar missing from an old session
+        for key in ("open", "high", "low", "close", "volume"):
+            del r["indicators"]["quote"][0][key][500]
+        del r["timestamp"][500]
+        out = tm.time_machine(json.dumps(doc), tm.normalize_plan(GOLD_SHORT), GOLD_NOW, replays=300)
+        self.assertEqual(out["mc"]["pool_sessions"], 28)
+        self.assertEqual(len(out["data"]["short_sessions_left_out"]), 1)
+
+    def test_a_session_that_wraps_past_midnight(self):
+        sess = tm.make_session(22 * 60, 5 * 60, "24h")
+        self.assertEqual((sess["bars"], sess["length"]), (84, 420))
+        # 23:55 and 00:00 Tuesday night / Wednesday morning belong to Tuesday's session
+        self.assertEqual(tm.slot_of(datetime.datetime(2026, 10, 20, 23, 55), sess), ("2026-10-20", 23))
+        self.assertEqual(tm.slot_of(datetime.datetime(2026, 10, 21, 0, 0), sess), ("2026-10-20", 24))
+        self.assertEqual(tm.slot_of(datetime.datetime(2026, 10, 21, 4, 55), sess), ("2026-10-20", 83))
+        self.assertIsNone(tm.slot_of(datetime.datetime(2026, 10, 21, 5, 0), sess))
+        self.assertIsNone(tm.slot_of(datetime.datetime(2026, 10, 21, 12, 0), sess))
+        text = synth_chart("EURUSD=X", "22:00", "05:00", "2026-10-20", weekdays=(0, 1, 2, 3, 6), start=1.1)
+        _e = bar_at(text, "2026-10-20", "22:15")[0]
+        plan24 = {"symbol": "EURUSD=X", "side": "buy", "date": "2026-10-20", "setup": "orb", "entry": _e,
+                  "entry_time": "22:20", "interval": "5m", "opening_range": {"minutes": 15},
+                  "stop": round(_e * 0.997, 4), "target": round(_e * 1.006, 4), "stop_rule": "pct",
+                  "session": {"kind": "24h", "open": "22:00", "close": "05:00"}}
+        p = tm.normalize_plan(plan24)
+        self.assertEqual((p["entry_bar"], p["entry_time"]), (3, "10:20 PM"))
+        doc = tm.time_machine(text, p, tm.parse_now("2026-10-21 06:00"), replays=500)
+        self.assertEqual(doc["mc"]["pool_sessions"], 29)
+        self.assertEqual(doc["mc"]["until"], "05:00")
+        self.assertEqual(doc["mc"]["bars_left"], 80)
+
+    def test_cli_24h_flags(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "g.json")
+            with open(path, "w") as fh:
+                fh.write(GOLD_TEXT)
+            out, err = io.StringIO(), io.StringIO()
+            p = GOLD_SHORT
+            with redirect_stdout(out), redirect_stderr(err):
+                code = tm.main(["run", "--symbol", "GC=F", "--side", "short", "--market", "24h", "--anchor", "08:20",
+                                "--close", "17:00", "--date", GOLD_DAY, "--entry", str(p["entry"]),
+                                "--stop", str(p["stop"]), "--target", str(p["target"]), "--entry-time", "8:45 AM",
+                                "--offline", path, "--now", "2026-10-21 17:30", "--replays", "500"])
+            self.assertEqual((code, err.getvalue()), (0, ""))
+            self.assertIn("GC=F sell", out.getvalue())
