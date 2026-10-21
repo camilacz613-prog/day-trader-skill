@@ -801,3 +801,172 @@ class Market24h(unittest.TestCase):
                                 "--offline", path, "--now", "2026-10-21 17:30", "--replays", "500"])
             self.assertEqual((code, err.getvalue()), (0, ""))
             self.assertIn("GC=F sell", out.getvalue())
+
+
+# ---------------------------------------------------------------- named sessions in their own zone (SYNTHETIC data)
+
+def zone_utc(local, zone):
+    """A naive wall-clock time in london / berlin / newyork -> naive UTC."""
+    for off in (-5, -4, 0, 1, 2):
+        utc = local - datetime.timedelta(hours=off)
+        if tm.zone_offset(utc, zone) == off:
+            return utc
+    raise AssertionError(local)
+
+
+def synth_zone(sym, zone, open_hm, close_hm, last_day, sessions=30, seed=11, start=4000.0, drift=0.0):
+    """SYNTHETIC 5-minute bars (a seeded random walk, not market data), one session per weekday whose window is
+    open_hm to close_hm in `zone`. Only those hours have bars, like a chart read by session."""
+    rng = random.Random(seed)
+    oh, om = [int(x) for x in open_hm.split(":")]
+    ch, cm = [int(x) for x in close_hm.split(":")]
+    length = ((ch * 60 + cm) - (oh * 60 + om)) % 1440
+    day, days = datetime.date.fromisoformat(last_day), []
+    while len(days) < sessions:
+        if day.weekday() < 5:
+            days.append(day)
+        day -= datetime.timedelta(days=1)
+    stamps, o, h, l, c, v = [], [], [], [], [], []
+    price = start
+    for d in reversed(days):
+        t0 = datetime.datetime.combine(d, datetime.time(oh, om))
+        for i in range(length // 5):
+            utc = zone_utc(t0 + datetime.timedelta(minutes=5 * i), zone)
+            op = price
+            price = price * (1 + drift + rng.gauss(0, 0.0007))
+            stamps.append(int((utc - datetime.datetime(1970, 1, 1)).total_seconds()))
+            o.append(round(op, 2))
+            h.append(round(max(op, price) * (1 + abs(rng.gauss(0, 0.0003))), 2))
+            l.append(round(min(op, price) * (1 - abs(rng.gauss(0, 0.0003))), 2))
+            c.append(round(price, 2))
+            v.append(100)
+    meta = {"symbol": sym, "dataGranularity": "5m", "regularMarketTime": stamps[-1] + 600}
+    return json.dumps({"chart": {"result": [{"meta": meta, "timestamp": stamps,
+                                             "indicators": {"quote": [{"open": o, "high": h, "low": l,
+                                                                      "close": c, "volume": v}]}}],
+                                 "error": None}})
+
+
+LONDON_SESSION = {"kind": "24h", "open": "03:00", "close": "09:30", "weekends": False, "tz": "london",
+                  "local_open": "08:00", "local_close": "14:30", "name": "london",
+                  "berlin": {"open": "09:00", "close": "15:30"}}
+
+
+def london_short_plan(text, day, session=LONDON_SESSION, bar="03:35"):
+    close = bar_at(text, day, bar)[0]
+    return {"symbol": "GC=F", "side": "sell", "date": day, "setup": "orb", "market": "24h", "session": session,
+            "entry": close, "entry_time": "3:40 AM", "entry_bar": 7, "interval": "5m",
+            "opening_range": {"high": round(close * 1.003, 2), "low": round(close * 1.001, 2), "minutes": 30},
+            "stop": round(close * 1.002, 2), "stop_rule": "or_mid", "target": round(close * 0.996, 2), "target_r": 2.0,
+            "risk_per_share": round(close * 0.002, 2), "flat_by": "09:25"}
+
+
+DT = datetime.datetime
+
+
+class NamedSessions(unittest.TestCase):
+    DAY = "2026-11-03"          # a Tuesday after the clock changes; the pool runs back through the weeks they differed
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = synth_zone("GC=F", "london", "08:00", "14:30", cls.DAY)
+        cls.now = tm.parse_now("2026-11-03 10:00")
+
+    def test_the_session_block_carries_its_zone(self):
+        sess = tm.session_of({"session": LONDON_SESSION})
+        self.assertEqual((sess["tz"], sess["bars"], sess["length"], sess["local_open_min"]), ("london", 78, 390, 480))
+        self.assertEqual(sess["open_min"], 180)                                    # 03:00 New York on the plan's date
+        self.assertNotIn("tz", tm.session_of({"session": dict(LONDON_SESSION, tz="newyork")}))
+        with self.assertRaises(tm.TMError) as e:
+            tm.session_of({"session": dict(LONDON_SESSION, local_close="15:00")})
+        self.assertIn("do not agree", str(e.exception))
+        with self.assertRaises(tm.TMError):
+            tm.session_of({"session": dict(LONDON_SESSION, tz="paris")})
+
+    def test_a_bar_is_read_in_the_session_zone_on_either_side_of_a_clock_change(self):
+        sess = tm.session_of({"session": LONDON_SESSION})
+        # 08:00 London: 03:00 New York in summer-time Europe and the US, 04:00 New York in the weeks between
+        self.assertEqual(tm.slot_of(DT(2026, 10, 21, 3, 0), sess), ("2026-10-21", 0))
+        self.assertIsNone(tm.slot_of(DT(2026, 10, 27, 3, 0), sess))                 # 07:00 London: before the open
+        self.assertEqual(tm.slot_of(DT(2026, 10, 27, 4, 0), sess), ("2026-10-27", 0))
+        self.assertEqual(tm.slot_of(DT(2026, 10, 27, 10, 25), sess), ("2026-10-27", 77))
+        self.assertIsNone(tm.slot_of(DT(2026, 10, 27, 10, 30), sess))
+        self.assertEqual(tm.slot_of(DT(2026, 11, 3, 3, 0), sess), ("2026-11-03", 0))
+
+    def test_the_pool_keeps_the_sessions_from_the_weeks_the_clocks_differed(self):
+        p = tm.normalize_plan(london_short_plan(self.text, self.DAY))
+        doc = tm.time_machine(self.text, p, self.now, replays=1500)
+        self.assertEqual(doc["mc"]["pool_sessions"], 29)                            # all 29 earlier sessions are full
+        self.assertEqual(doc["data"]["short_sessions_left_out"], [])
+        self.assertEqual(doc["data"]["dropped"]["outside_hours"], 0)
+        self.assertEqual((doc["plan"]["session"]["tz"], doc["plan"]["session"]["berlin"]["open"]), ("london", "09:00"))
+        # without the zone the same plan reads a fixed 03:00 to 09:30 New York window: the sessions in the weeks
+        # between the clock changes (04:00 to 10:30 New York) are no longer full, so they drop out
+        fixed = tm.normalize_plan(london_short_plan(self.text, self.DAY, {"kind": "24h", "open": "03:00", "close": "09:30"}))
+        doc2 = tm.time_machine(self.text, fixed, self.now, replays=300)
+        self.assertLess(doc2["mc"]["pool_sessions"], 29)
+
+    def test_a_short_replay_on_the_london_session(self):
+        p = tm.normalize_plan(london_short_plan(self.text, self.DAY))
+        self.assertEqual((p["side"], p["entry_bar"], p["entry_time"]), ("sell", 7, "3:40 AM"))
+        doc = tm.time_machine(self.text, p, self.now, replays=4000)
+        mc = doc["mc"]
+        self.assertEqual((mc["until"], mc["bars_left"], mc["band_times"][0]), ("09:30", 70, "03:40"))
+        self.assertAlmostEqual(mc["p_target"] + mc["p_stop"] + mc["p_neither"], 1.0, places=3)
+        self.assertEqual(doc["history"]["rule"]["or_minutes"], 30)
+        text = "\n".join(tm.report(doc))
+        self.assertIn("GC=F sell", text)
+        self.assertIn("below the entry", text)
+        self.assertIn("30-min opening range", text)
+        # the same seed gives the same numbers
+        self.assertEqual(tm.time_machine(self.text, p, self.now, replays=4000)["mc"]["p_target"], mc["p_target"])
+
+    def test_a_falling_market_favours_the_short_and_a_rising_one_the_stop(self):
+        res = {}
+        for name, drift in (("down", -0.0008), ("up", 0.0008)):
+            text = synth_zone("GC=F", "london", "08:00", "14:30", self.DAY, drift=drift, seed=3)
+            p = tm.normalize_plan(london_short_plan(text, self.DAY))
+            res[name] = tm.time_machine(text, p, self.now, replays=3000)["mc"]
+        self.assertGreater(res["down"]["p_target"], res["up"]["p_target"])
+        self.assertGreater(res["up"]["p_stop"], res["down"]["p_stop"])
+        self.assertGreater(res["down"]["avg_R"], res["up"]["avg_R"])
+
+    def test_the_history_replay_enters_short_below_the_30_minute_range_low(self):
+        p = tm.normalize_plan(london_short_plan(self.text, self.DAY))
+        doc = tm.time_machine(self.text, p, self.now, replays=200)
+        h = doc["history"]
+        self.assertGreater(h["triggered"], 0)
+        for t in h["trades"]:
+            self.assertGreater(t["stop"], t["entry"])
+            self.assertLess(t["target"], t["entry"])
+        # every logged entry time is a 5-minute close at or after 03:30 New York time (the 30-minute range)
+        self.assertTrue(all(t["time"].endswith(("AM", "PM")) for t in h["trades"]))
+
+    def test_the_ny_session_with_a_long_and_the_flat_by_not_after_the_close(self):
+        text = synth_zone("GC=F", "newyork", "09:30", "16:00", self.DAY, seed=21)
+        sess = {"kind": "24h", "open": "09:30", "close": "16:00", "weekends": False, "tz": "newyork",
+                "local_open": "09:30", "local_close": "16:00", "name": "ny", "berlin": {"open": "15:30", "close": "22:00"}}
+        close = bar_at(text, self.DAY, "10:05")[0]
+        raw = {"symbol": "GC=F", "side": "buy", "date": self.DAY, "setup": "orb", "market": "24h", "session": sess,
+               "entry": close, "entry_time": "10:10 AM", "entry_bar": 7, "interval": "5m",
+               "opening_range": {"minutes": 30}, "stop": round(close * 0.998, 2), "stop_rule": "or_mid",
+               "target": round(close * 1.004, 2), "target_r": 2.0, "risk_per_share": round(close * 0.002, 2)}
+        later = tm.parse_now("2026-11-03 17:00")
+        doc = tm.time_machine(text, tm.normalize_plan(raw), later, replays=1000, until="15:55")
+        self.assertEqual((doc["mc"]["until"], doc["mc"]["pool_sessions"]), ("15:55", 29))
+        with self.assertRaises(tm.TMError):
+            tm.time_machine(text, tm.normalize_plan(raw), later, replays=100, until="16:05")
+
+    def test_ticker_with_an_equals_sign_survives_the_cli_offline(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "g.json")
+            with open(path, "w") as fh:
+                json.dump(london_short_plan(self.text, self.DAY), fh)
+            data = os.path.join(d, "bars.json")
+            with open(data, "w") as fh:
+                fh.write(self.text)
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = tm.main(["run", "--plan", path, "--offline", data, "--now", "2026-11-03 10:00", "--replays", "500"])
+            self.assertEqual((code, err.getvalue()), (0, ""))
+            self.assertIn("GC=F sell", out.getvalue())

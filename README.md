@@ -168,7 +168,9 @@ until you turn them on in `trader/config.json`.
   0.01 with a `leverage`, an account currency (`fx_rate`) and a max loss as a percent of the budget
   (`config.gold-demo.example.json`); leverage needs `"allow_margin": true`.
 
-The opening-range idea comes from the stock market's open. A 24h market has no such moment, so you pick
+For gold there are two named sessions, `--session london` (08:00 to 14:30 London, 09:00 to 15:30 Berlin) and
+`--session ny` (09:30 to 16:00 New York, 15:30 to 22:00 Berlin most of the year), each with a 30-minute opening
+range and its own time zone. The opening-range idea comes from the stock market's open. A 24h market has no such moment, so you pick
 the anchor, and the Time Machine's history replay tells you whether the rule worked on that symbol.
 
 ## Fine print

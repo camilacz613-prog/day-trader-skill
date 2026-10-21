@@ -148,7 +148,8 @@ the user should hear before `/trader-budget` sizes 8 shares.
   York time). The pool is built from that window instead of 9:30 to 16:00: a full session is every
   5-minute bar from the open to the close (104 bars for 08:20 to 17:00), and a session that runs past
   midnight belongs to the date it started on. A session with a missing bar (a holiday, a halt) is left
-  out like a half day. Symbols such as `GC=F`, `EURUSD=X` and `BTC-USD` work. With flags:
+  out like a half day. A named session (`london`, `ny`) carries its zone, and the pool is read in that zone
+  for every past date, so a clock change does not shift it. Symbols such as `GC=F`, `EURUSD=X` and `BTC-USD` work. With flags:
   `--symbol GC=F --market 24h --anchor 08:20 --close 17:00`. Bare clock times are 24-hour there
   (`--until 16:55`).
 - Yahoo keeps about 60 days of 5-minute bars, so a 24h pool is also about 40 to 60 sessions, and the

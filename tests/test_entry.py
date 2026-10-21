@@ -752,3 +752,145 @@ class Market24h(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(res["trigger"]["bar_start"], "08:40")
         self.assertTrue(any("TRIGGERED" in l for l in lines))
+
+
+# ---------------------------------------------------------------- named sessions: london and ny, in their own zones
+
+LONDON_RANGE = [(100, 101, 99.5, 100.5, 10), (100.5, 100.9, 99.2, 99.8, 12), (99.8, 100.4, 99.0, 100.0, 11),
+                (100.0, 100.8, 99.4, 100.2, 9), (100.2, 100.6, 99.5, 99.9, 10), (99.9, 100.5, 99.3, 100.1, 9)]
+# 30 minutes = 6 bars, range high 101.0, low 99.0. Then: inside, a close under the low, a close over the high.
+LONDON_AFTER = [(100.1, 100.3, 99.4, 99.6, 8), (99.6, 99.7, 98.2, 98.4, 30), (98.4, 101.8, 98.3, 101.5, 40),
+                (101.5, 101.6, 101.0, 101.2, 8)]
+LONDON_BARS = LONDON_RANGE + LONDON_AFTER
+LONDON_OPEN_UTC = DT(2026, 10, 21, 7, 0)            # 08:00 London summer time = 07:00 UTC = 03:00 New York = 09:00 Berlin
+
+
+class Zones(unittest.TestCase):
+    def test_europe_and_us_clock_changes(self):
+        for utc, ny_off, lon, ber in ((DT(2026, 3, 8, 6, 59), -5, 0, 1), (DT(2026, 3, 8, 7, 0), -4, 0, 1),     # US first
+                                      (DT(2026, 3, 29, 0, 59), -4, 0, 1), (DT(2026, 3, 29, 1, 0), -4, 1, 2),   # then Europe
+                                      (DT(2026, 10, 25, 0, 59), -4, 1, 2), (DT(2026, 10, 25, 1, 0), -4, 0, 1),  # Europe first
+                                      (DT(2026, 11, 1, 6, 0), -5, 0, 1), (DT(2026, 7, 1, 12, 0), -4, 1, 2)):
+            self.assertEqual((entry.zone_offset(utc, "newyork"), entry.zone_offset(utc, "london"),
+                              entry.zone_offset(utc, "berlin")), (ny_off, lon, ber), utc)
+
+    def test_local_time_round_trip(self):
+        for local in (DT(2026, 10, 21, 8, 0), DT(2026, 1, 15, 8, 0), DT(2026, 10, 27, 8, 0), DT(2026, 3, 30, 14, 30)):
+            for zone in ("london", "berlin", "newyork"):
+                utc = entry.zone_to_utc(local, zone)
+                self.assertEqual(utc + datetime.timedelta(hours=entry.zone_offset(utc, zone)), local, (local, zone))
+
+    def test_the_two_sessions_in_new_york_and_berlin_time(self):
+        # (date, london ET window, london Berlin, ny ET window, ny Berlin)
+        table = (("2026-10-21", ("03:00", "09:30"), ("09:00", "15:30"), ("09:30", "16:00"), ("15:30", "22:00")),
+                 ("2026-01-14", ("03:00", "09:30"), ("09:00", "15:30"), ("09:30", "16:00"), ("15:30", "22:00")),
+                 ("2026-03-10", ("04:00", "10:30"), ("09:00", "15:30"), ("09:30", "16:00"), ("14:30", "21:00")),   # US on summer time, Europe not yet
+                 ("2026-10-27", ("04:00", "10:30"), ("09:00", "15:30"), ("09:30", "16:00"), ("14:30", "21:00")),   # Europe back, US not yet
+                 ("2026-11-03", ("03:00", "09:30"), ("09:00", "15:30"), ("09:30", "16:00"), ("15:30", "22:00")))
+        for day, l_et, l_be, n_et, n_be in table:
+            d = datetime.date.fromisoformat(day)
+            for name, et, be in (("london", l_et, l_be), ("ny", n_et, n_be)):
+                m = entry.make_market(session=name)
+                o, c = entry.session_window(d, m)
+                b = entry.session_block(m, o, c)
+                self.assertEqual(((entry.hm(o.time()), entry.hm(c.time())), (b["berlin"]["open"], b["berlin"]["close"])),
+                                 (et, be), (day, name))
+                self.assertEqual((c - o).total_seconds(), 6.5 * 3600)
+
+    def test_a_literal_berlin_clock_window(self):
+        m = entry.make_market(tz="berlin", anchor="15:30", close="22:00", kind="24h")
+        o, c = entry.session_window(datetime.date(2026, 10, 27), m)               # a gap week: 15:30 Berlin is 10:30 New York
+        self.assertEqual((entry.hm(o.time()), entry.hm(c.time())), ("10:30", "17:00"))
+        o, c = entry.session_window(datetime.date(2026, 10, 21), m)
+        self.assertEqual((entry.hm(o.time()), entry.hm(c.time())), ("09:30", "16:00"))
+
+    def test_bad_session_flags(self):
+        for kw, word in ((dict(session="paris"), "--session is london or ny"), (dict(tz="tokyo", kind="24h"), "--tz is"),
+                         (dict(session="london", tz="newyork"), "drop --tz")):
+            with self.assertRaises(entry.EntryError) as e:
+                entry.make_market(**kw)
+            self.assertIn(word, str(e.exception))
+
+
+class LondonAndNewYork(unittest.TestCase):
+    def ev(self, now, side, bars=LONDON_BARS, open_utc=LONDON_OPEN_UTC, session="london", or_minutes=30, **kw):
+        c = entry.parse_chart(json.dumps(synth(open_utc, bars)), "GC=F")
+        return entry.evaluate(c, ny(now), side=side, or_minutes=or_minutes, market=entry.make_market(session=session), **kw)
+
+    def test_the_london_range_is_the_first_30_minutes_after_09_00_berlin(self):
+        r = self.ev("2026-10-21 03:45", "sell")
+        self.assertEqual((r["opens"], r["closes"], r["no_entries_after"]), ("03:00", "09:30", "09:00"))
+        self.assertEqual(r["opening_range"], {"high": 101.0, "low": 99.0, "minutes": 30, "bars": 6, "of": 6,
+                                               "complete": True, "avg_volume": 10})
+
+    def test_short_breakout_down_through_the_range_low(self):
+        r = self.ev("2026-10-21 03:55", "sell")
+        self.assertEqual((r["status"], r["side"], r["level"]), ("triggered", "sell", 99.0))
+        t = r["trigger"]
+        self.assertEqual((t["bar_start"], t["time"], t["price"], t["bar_index"]), ("03:35", "3:40 AM", 98.4, 7))
+        text = "\n".join(entry.describe(r))
+        self.assertIn("London session, session 03:00 to 09:30 New York (09:00 to 15:30 Berlin)", text)
+        self.assertIn("closed below the range low $99.00", text)
+        doc = entry.entry_doc(r, ny("2026-10-21 03:55"))
+        self.assertEqual((doc["side"], doc["market"], doc["date"]), ("sell", "24h", "2026-10-21"))
+        self.assertEqual(doc["session"], {"kind": "24h", "open": "03:00", "close": "09:30", "weekends": False,
+                                          "tz": "london", "local_open": "08:00", "local_close": "14:30",
+                                          "name": "london", "berlin": {"open": "09:00", "close": "15:30"}})
+        self.assertEqual(doc["opening_range"], {"high": 101.0, "low": 99.0, "minutes": 30})
+
+    def test_long_breakout_up_through_the_range_high_is_the_mirror(self):
+        r = self.ev("2026-10-21 04:05", "buy")
+        self.assertEqual((r["status"], r["level"], r["trigger"]["bar_start"], r["trigger"]["price"]),
+                         ("triggered", 101.0, "03:40", 101.5))
+        self.assertEqual(self.ev("2026-10-21 03:44", "buy")["status"], "waiting")
+
+    def test_nothing_before_the_range_is_complete_and_nothing_after_the_cutoff(self):
+        r = self.ev("2026-10-21 03:25", "sell")
+        self.assertEqual((r["status"], r["phase"]), ("waiting", "forming"))
+        r = self.ev("2026-10-21 02:30", "sell")
+        self.assertEqual((r["phase"], r["reason"][:24]), ("pre-open", "the session opens at 3:0"))
+        quiet = LONDON_RANGE + [(100.1, 100.3, 99.4, 99.6, 8)] * 5
+        r = self.ev("2026-10-21 09:05", "sell", bars=quiet)
+        self.assertEqual(r["status"], "expired")
+
+    def test_the_new_york_session_opens_at_09_30_new_york(self):
+        ny_bars = [tuple(b) for b in LONDON_BARS]
+        r = self.ev("2026-10-21 10:25", "sell", bars=ny_bars, open_utc=DT(2026, 10, 21, 13, 30), session="ny")
+        self.assertEqual((r["opens"], r["closes"], r["status"]), ("09:30", "16:00", "triggered"))
+        self.assertEqual(r["trigger"]["time"], "10:10 AM")
+        self.assertEqual(r["session"]["berlin"], {"open": "15:30", "close": "22:00"})
+        self.assertEqual(r["session"]["name"], "ny")
+
+    def test_in_the_weeks_the_clocks_differ_the_sessions_move_in_new_york_time(self):
+        # Tue 2026-10-27: London is back on winter time (08:00 = 04:00 New York), Berlin 09:00 as always
+        r = self.ev("2026-10-27 04:45", "sell", open_utc=DT(2026, 10, 27, 8, 0))
+        self.assertEqual((r["date"], r["opens"], r["status"]), ("2026-10-27", "04:00", "triggered"))
+        self.assertEqual(r["session"]["berlin"]["open"], "09:00")
+        # the same bars read as a stock-style fixed 03:00 window would be wrong: nothing before 04:00 counts
+        r = self.ev("2026-10-27 03:45", "sell", open_utc=DT(2026, 10, 27, 8, 0))
+        self.assertEqual(r["phase"], "pre-open")
+
+    def test_week_and_weekend_rules_use_the_new_york_window(self):
+        m = entry.make_market(session="london")
+        self.assertTrue(entry.trading_day(datetime.date(2026, 10, 23), m)[0])        # Friday, ends 09:30 New York
+        self.assertFalse(entry.trading_day(datetime.date(2026, 10, 24), m)[0])       # Saturday
+        self.assertFalse(entry.trading_day(datetime.date(2026, 10, 25), m)[0])       # Sunday morning: the market is shut
+        self.assertEqual(entry.next_open(datetime.date(2026, 10, 23), m), "2026-10-26 04:00")   # Europe is back on winter time from Oct 25
+
+    def test_session_day_inside_the_window(self):
+        m = entry.make_market(session="london")
+        self.assertEqual(entry.session_day(DT(2026, 10, 21, 5, 0), m), datetime.date(2026, 10, 21))
+
+    def test_cli_london_short_defaults_to_a_30_minute_range(self):
+        path = _write_tmp(synth(LONDON_OPEN_UTC, LONDON_BARS))
+        code, text, err = run(["check", "GC=F", "--offline", path, "--now", "2026-10-21 03:55", "--session", "london",
+                               "--side", "short"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("(30-minute range)", text)
+        self.assertIn("09:00 to 15:30 Berlin", text)
+        code, text, err = run(["check", "GC=F", "--offline", path, "--now", "2026-10-21 03:55", "--session", "london",
+                               "--side", "short", "--or-minutes", "15"])
+        self.assertIn("(15-minute range)", text)
+        code, _, err = run(["check", "GC=F", "--offline", path, "--session", "london", "--tz", "berlin"])
+        self.assertEqual(code, 1)
+        self.assertIn("drop --tz", err)

@@ -39,6 +39,18 @@ completed bar that CLOSES BELOW the range low; a level setup on the first close 
 --level. The result and entry.json carry "side": "sell". A short needs a broker that
 lends the shares (and margin): trader-risk blocks it unless "allow_short" is true.
 
+Named sessions for gold: --session london and --session ny are the two cash-market opens that
+move gold, each with its own 30-minute opening range and its own flat-by:
+  london   08:00 to 14:30 London time  = 09:00 to 15:30 Berlin (always, London and Berlin switch
+           to summer time on the same day)
+  ny       09:30 to 16:00 New York time = 15:30 to 22:00 Berlin, except in the weeks when the US
+           and Europe are on different clocks (about 3 weeks in March and 1 in late October),
+           when the New York open falls at 14:30 Berlin
+The session is looked up for each date with its own time zone, so the result carries both the
+New York and the Berlin times. --tz berlin|london|newyork with --anchor/--close sets any other
+window in that zone, for example --tz berlin --anchor 15:30 --close 22:00 pins the Berlin clock.
+--or-minutes defaults to 30 with --session.
+
 24h markets: --market 24h trades a symbol that has no stock-market open (gold futures
 GC=F, forex EURUSD=X, crypto BTC-USD). There is no 9:30 open, so YOU name the session:
 --anchor HH:MM is where the opening range starts (New York time, default 08:20, the
@@ -160,6 +172,51 @@ def eastern_to_utc(local):
     return local + datetime.timedelta(hours=5)
 
 
+ZONES = {"newyork": "America/New_York", "london": "Europe/London", "berlin": "Europe/Berlin"}
+SESSIONS = {
+    "london": {"tz": "london", "open": "08:00", "close": "14:30", "label": "London"},
+    "ny": {"tz": "newyork", "open": "09:30", "close": "16:00", "label": "New York"},
+}
+
+
+def _last_sunday(year, month):
+    d = datetime.date(year, month + 1, 1) - datetime.timedelta(days=1) if month < 12 else datetime.date(year, 12, 31)
+    return d - datetime.timedelta(days=(d.weekday() + 1) % 7)
+
+
+def zone_offset(utc, zone):
+    """Hours from UTC for newyork, london or berlin at this naive UTC time. Europe switches at
+    01:00 UTC on the last Sundays of March and October (rule since 1996); the US at 2:00 local on
+    the second Sunday of March and the first Sunday of November."""
+    if zone == "newyork":
+        return eastern_offset(utc)
+    start = datetime.datetime.combine(_last_sunday(utc.year, 3), datetime.time(1, 0))
+    end = datetime.datetime.combine(_last_sunday(utc.year, 10), datetime.time(1, 0))
+    summer = start <= utc.replace(tzinfo=None) < end
+    return (1 if summer else 0) + (1 if zone == "berlin" else 0)
+
+
+def zone_to_utc(local, zone):
+    """A naive wall-clock time in that zone -> naive UTC (a time that does not exist when the clocks
+    jump forward is read with the winter offset)."""
+    for off in (-5, -4, 0, 1, 2):
+        utc = local - datetime.timedelta(hours=off)
+        if zone_offset(utc, zone) == off:
+            return utc
+    return local - datetime.timedelta(hours=zone_offset(local, zone))
+
+
+def from_zone(local, zone):
+    """A wall-clock time in `zone` -> New York wall-clock time."""
+    return to_eastern(zone_to_utc(local, zone))
+
+
+def in_zone(et, zone):
+    """A New York wall-clock time -> the wall-clock time in `zone`."""
+    utc = eastern_to_utc(et)
+    return utc + datetime.timedelta(hours=zone_offset(utc, zone))
+
+
 def utc_now():
     return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
 
@@ -219,15 +276,31 @@ def ampm(t):
     return "%d:%02d %s" % (h, t.minute, "AM" if t.hour < 12 else "PM")
 
 
-def make_market(kind="stock", anchor=None, close=None, weekends=False):
-    """The market the rules run on. "stock" is the NYSE session; "24h" is a session
-    you name (anchor and close, New York time) for futures, forex and crypto."""
+def make_market(kind="stock", anchor=None, close=None, weekends=False, tz=None, session=None):
+    """The market the rules run on. "stock" is the NYSE session; "24h" is a session you name
+    for futures, forex and crypto: an anchor and a close, in New York time or in the zone
+    `tz` (newyork, london, berlin), or one of the named sessions (london, ny)."""
     if kind not in ("stock", "24h"):
         raise EntryError("--market is stock or 24h")
+    if session is not None and session not in SESSIONS:
+        raise EntryError("--session is london or ny")
+    if tz is not None and tz not in ZONES:
+        raise EntryError("--tz is newyork, london or berlin")
+    if session is not None:
+        kind = "24h"
     if kind == "stock":
         return {"kind": "stock"}
-    return {"kind": "24h", "anchor": parse_hhmm(anchor or DEFAULT_ANCHOR, "--anchor"),
-            "close": parse_hhmm(close or DEFAULT_CLOSE_24H, "--close"), "weekends": bool(weekends)}
+    base = SESSIONS.get(session) or {}
+    zone = tz or base.get("tz") or "newyork"
+    if session is not None and tz is not None and tz != base["tz"]:
+        raise EntryError("--session %s is a %s time session: drop --tz, or use --tz with --anchor and --close"
+                         % (session, ZONES[base["tz"]]))
+    m = {"kind": "24h", "anchor": parse_hhmm(anchor or base.get("open") or DEFAULT_ANCHOR, "--anchor"),
+         "close": parse_hhmm(close or base.get("close") or DEFAULT_CLOSE_24H, "--close"),
+         "weekends": bool(weekends), "tz": zone}
+    if session is not None:
+        m["name"] = session
+    return m
 
 
 STOCK = {"kind": "stock"}
@@ -250,12 +323,16 @@ def _in_market_week(t):
 
 
 def session_window(d, market=None):
-    """(open_dt, close_dt) as New York datetimes for the session that starts on date d."""
+    """(open_dt, close_dt) as New York datetimes for the session that starts on date d (the date
+    in the session's own zone)."""
     if is_24h(market):
         open_dt = datetime.datetime.combine(d, market["anchor"])
         close_dt = datetime.datetime.combine(d, market["close"])
         if close_dt <= open_dt:
             close_dt += datetime.timedelta(days=1)
+        zone = market.get("tz") or "newyork"
+        if zone != "newyork":
+            open_dt, close_dt = from_zone(open_dt, zone), from_zone(close_dt, zone)
         return open_dt, close_dt
     return (datetime.datetime.combine(d, OPEN),
             datetime.datetime.combine(d, EARLY if d.isoformat() in NYSE_EARLY_CLOSE else CLOSE))
@@ -286,7 +363,8 @@ def session(d, market=None):
     if not ok:
         return None
     if is_24h(market):
-        return market["anchor"], market["close"]
+        o, c = session_window(d, market)
+        return o.time(), c.time()
     return OPEN, (EARLY if d.isoformat() in NYSE_EARLY_CLOSE else CLOSE)
 
 
@@ -295,10 +373,14 @@ def session_day(local, market=None):
     session that began yesterday evening is still running."""
     d = local.date()
     if is_24h(market):
+        for cand in (d - datetime.timedelta(days=1), d, d + datetime.timedelta(days=1)):
+            if session(cand, market):
+                o, c = session_window(cand, market)
+                if o <= local < c:
+                    return cand
         y = d - datetime.timedelta(days=1)
-        if session(y, market):
-            if session_window(y, market)[1] > local:
-                return y
+        if session(y, market) and session_window(y, market)[1] > local:
+            return y
     return d
 
 
@@ -499,6 +581,23 @@ def _wall_after(open_dt, t):
     return at if at >= open_dt else at + datetime.timedelta(days=1)
 
 
+def session_block(market, open_dt, close_dt):
+    """The session as trader/entry.json carries it: New York times for this date, plus the zone it was
+    set in and the Berlin clock when it is not a New York time session."""
+    if not is_24h(market):
+        return {"kind": "stock"}
+    b = {"kind": "24h", "open": hm(open_dt.time()), "close": hm(close_dt.time()),
+         "weekends": bool(market["weekends"])}
+    zone = market.get("tz") or "newyork"
+    if zone != "newyork" or market.get("name"):
+        b.update(tz=zone, local_open=hm(market["anchor"]), local_close=hm(market["close"]))
+        if market.get("name"):
+            b["name"] = market["name"]
+    bo, bc = in_zone(open_dt, "berlin"), in_zone(close_dt, "berlin")
+    b["berlin"] = {"open": hm(bo.time()), "close": hm(bc.time())}
+    return b
+
+
 def side_of(text):
     """--side -> "buy" or "sell"."""
     s = str(text or "buy").lower()
@@ -559,8 +658,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         before = datetime.datetime.combine(day, parse_hhmm(cfg["no_entries_before"], "no_entries_before"))
         cutoff = early_cutoff(day, parse_hhmm(cfg["no_entries_after"], "no_entries_after"), close_dt)
     or_end = open_dt + datetime.timedelta(minutes=or_minutes)
-    res["session"] = ({"kind": "24h", "open": hm(o), "close": hm(c), "weekends": bool(market["weekends"])}
-                      if is_24h(market) else {"kind": "stock"})
+    res["session"] = session_block(market, open_dt, close_dt)
     res.update(opens=hm(o), closes=hm(c), early_close=None if is_24h(market) else NYSE_EARLY_CLOSE.get(day.isoformat()),
                no_entries_before=hm(before), no_entries_after=hm(cutoff))
 
@@ -780,8 +878,11 @@ def describe(res):
         out.append("Early close today at 1:00 p.m. (%s): no new entries after %s." % (
             res["early_close"], res["no_entries_after"]))
     if res.get("market") == "24h":
-        out.append("24h market: session %s to %s New York, no holiday calendar. A holiday or thin day shows up "
-                   "as missing bars." % (res["opens"], res["closes"]))
+        sess = res.get("session") or {}
+        name = {"london": "London session, ", "ny": "New York session, "}.get(sess.get("name"), "")
+        berlin = (" (%s to %s Berlin)" % (sess["berlin"]["open"], sess["berlin"]["close"])) if sess.get("berlin") else ""
+        out.append("24h market: %ssession %s to %s New York%s, no holiday calendar. A holiday or thin day shows up "
+                   "as missing bars." % (name, res["opens"], res["closes"], berlin))
     elif not res.get("calendar_known"):
         out.append("Holiday list covers %s only: check nyse.com for this date." % " and ".join(map(str, CALENDAR_YEARS)))
     return out
@@ -929,15 +1030,16 @@ def _opts(a, cfg):
         raise EntryError("--min-volume-x must be above 0")
     if a.level is not None and a.level <= 0:
         raise EntryError("--level must be a price above 0")
-    return {"setup": a.setup, "or_minutes": a.or_minutes, "interval": a.interval, "level": a.level,
+    or_minutes = a.or_minutes if a.or_minutes is not None else (30 if a.session else 15)
+    return {"setup": a.setup, "or_minutes": or_minutes, "interval": a.interval, "level": a.level,
             "min_volume_x": a.min_volume_x, "cfg": cfg, "side": side_of(a.side),
-            "market": make_market(a.market, a.anchor, a.close, a.weekends)}
+            "market": make_market(a.market, a.anchor, a.close, a.weekends, a.tz, a.session)}
 
 
 def _load(a, sym, now):
     """(chart, now). An offline file without --now is read as of its own time."""
     real_today = to_eastern(utc_now()).date()
-    market = make_market(a.market, a.anchor, a.close, a.weekends)
+    market = make_market(a.market, a.anchor, a.close, a.weekends, a.tz, a.session)
     if a.offline and now is None:
         ch = get_chart(sym, a.interval, offline=a.offline)
         return ch, (utc_of(ch["data_time"]) if ch.get("data_time") else utc_now())
@@ -1065,7 +1167,8 @@ def main(argv=None):
 
     def common(p):
         p.add_argument("--setup", choices=["orb", "level"], default="orb")
-        p.add_argument("--or-minutes", type=int, default=15, help="opening range length (default 15)")
+        p.add_argument("--or-minutes", type=int, default=None,
+                       help="opening range length (default 15; 30 with --session)")
         p.add_argument("--interval", choices=["5m", "1m"], default="5m")
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
         p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")
@@ -1074,8 +1177,12 @@ def main(argv=None):
                             "(watchlist: the scanner's side)")
         p.add_argument("--market", default="stock", choices=["stock", "24h"],
                        help="stock = NYSE hours (default); 24h = a session you name (futures, forex, crypto)")
-        p.add_argument("--anchor", help="24h: where the opening range starts, New York HH:MM (default 08:20)")
-        p.add_argument("--close", help="24h: where the session ends, New York HH:MM (default 17:00)")
+        p.add_argument("--anchor", help="24h: where the opening range starts, HH:MM in --tz (default New York 08:20)")
+        p.add_argument("--close", help="24h: where the session ends, HH:MM in --tz (default New York 17:00)")
+        p.add_argument("--session", choices=["london", "ny"],
+                       help="the London (08:00-14:30 London) or New York (09:30-16:00 New York) open, 30-minute range")
+        p.add_argument("--tz", choices=["newyork", "london", "berlin"],
+                       help="the zone of --anchor and --close (default newyork)")
         p.add_argument("--weekends", action="store_true", help="24h: trade Saturday and Sunday too (crypto)")
         p.add_argument("--now", help='pretend it is this New York time, e.g. "2026-10-19 10:15"')
         p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")

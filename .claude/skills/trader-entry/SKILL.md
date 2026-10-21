@@ -13,7 +13,7 @@ description: >-
   TSLA", "has it broken out", "did it break the opening range", "entry
   signal", "time my entry", "check my watchlist", or after /trader-scanner
   and /trader-news, before /trader-exit.
-argument-hint: "[TICKER] [--setup orb|level] [--interval 5m|1m] [--side buy|sell] [--market stock|24h]"
+argument-hint: "[TICKER] [--setup orb|level] [--interval 5m|1m] [--side buy|sell] [--market stock|24h] [--session london|ny]"
 ---
 
 # trader-entry
@@ -154,6 +154,33 @@ burst of orders sets the range. A 24h market has no such moment, so the anchor i
 rule has no reason to work there until the Time Machine's history replay says it did on that symbol.
 There is no holiday calendar for these markets: a holiday shows up as missing bars, and the result
 says so. Yahoo's futures and forex prices are delayed and unofficial.
+
+## Gold: the London and New York opens
+
+For gold futures (`GC=F`) there are two named sessions, each with its own 30-minute opening range:
+
+| `--session` | window | in Berlin time |
+| --- | --- | --- |
+| `london` | 08:00 to 14:30 London time | 09:00 to 15:30, always (London and Berlin change clocks together) |
+| `ny` | 09:30 to 16:00 New York time | 15:30 to 22:00, except in the weeks the US and Europe are on different clocks |
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check GC=F --session london --side sell --write   # short below the range low
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check GC=F --session ny --write                     # long above the range high
+python3 "${CLAUDE_SKILL_DIR}/entry.py" watch GC=F --session ny --side sell --until 21:00
+```
+
+`--or-minutes` defaults to 30 with `--session`. Each date is worked out in the session's own zone, so
+the result shows the New York window and the Berlin clock for that day. In the roughly three weeks in
+March and the one week in late October when the US and Europe are on different clocks, the New York open
+is at 14:30 Berlin, not 15:30, and the London open is at 04:00 New York, not 03:00. To pin the Berlin
+clock instead, give the window in that zone: `--tz berlin --anchor 15:30 --close 22:00`.
+
+The short side is the mirror: a close below the range low triggers it, `/trader-exit` puts the stop at
+the range midpoint (`or-mid`, the default) and the target at a multiple of the risk (`--target 2R`,
+`3R`). The plan then flows to `/trader-timemachine`, `/trader-budget` and `/trader-risk` with the session,
+its zone and the Berlin clock attached. The trade itself is entered by hand at your own broker (a manual
+ticket from `/trader-broker`); nothing here places an order.
 
 ## Rules
 

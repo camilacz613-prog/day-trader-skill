@@ -218,7 +218,11 @@ def market_from_doc(doc):
     """The market of an entry.json or plan.json ("session": {"kind": "24h", "open", "close", "weekends"})."""
     sess = (doc or {}).get("session") or {}
     if sess.get("kind") == "24h":
-        return make_market("24h", sess.get("open"), sess.get("close"), sess.get("weekends"))
+        m = make_market("24h", sess.get("open"), sess.get("close"), sess.get("weekends"))
+        # the open and close are this date's New York times; the zone, the local times, the name and the
+        # Berlin clock (a named session like london) ride along for trader-timemachine
+        m["extra"] = {k: v for k, v in sess.items() if k not in ("kind", "open", "close", "weekends")}
+        return m
     return dict(STOCK)
 
 
@@ -730,8 +734,9 @@ def build_plan(a, now_utc):
                "minutes": int(info["or_minutes"] or 15)}
     plan = {"created_by": "trader-exit", "symbol": info["symbol"], "side": side, "date": day.isoformat(),
             "market": market["kind"],
-            "session": ({"kind": "24h", "open": hm(market["anchor"]), "close": hm(market["close"]),
-                         "weekends": market["weekends"]} if is_24h(market) else {"kind": "stock"}),
+            "session": (dict({"kind": "24h", "open": hm(market["anchor"]), "close": hm(market["close"]),
+                              "weekends": market["weekends"]}, **market.get("extra", {}))
+                        if is_24h(market) else {"kind": "stock"}),
             "setup": info["setup"], "entry": float(c["entry"]),
             "entry_time": ampm(entry_time) if entry_time else None,
             "entry_bar": info["entry_bar"], "interval": info["interval"], "opening_range": orr,
@@ -781,8 +786,9 @@ def describe(plan):
         "unit " if sess.get("kind") == "24h" else "share", money(plan["risk_per_share"]), pct))
     out.append("  Reward:risk   %s" % ratio(plan["reward_risk"]))
     if sess.get("kind") == "24h":
-        out.append("  Flat by       %s ET, win or lose (session %s to %s ET, 24h market)" % (
-            plan["flat_by"], sess.get("open"), sess.get("close")))
+        out.append("  Flat by       %s ET, win or lose (session %s to %s ET%s, 24h market)" % (
+            plan["flat_by"], sess.get("open"), sess.get("close"),
+            (", %s to %s Berlin" % (sess["berlin"]["open"], sess["berlin"]["close"])) if sess.get("berlin") else ""))
     else:
         out.append("  Flat by       %s ET, win or lose: no overnight hold" % plan["flat_by"])
     out.append("Set before the entry. If price hits the stop, you are out; never move it further away.")

@@ -67,6 +67,12 @@ the same way mirrored: the stop is touched when a bar's high reaches it, the tar
 its low reaches it, "green" means below the entry at --until, and the history replay
 enters on the first close BELOW the opening-range low.
 
+Named sessions (london, ny): a plan from `entry.py --session london` carries "tz": "london" and
+the session's local open and close (08:00 to 14:30 London time). The pool is then built in that zone,
+bar by bar, for every past date: 08:00 London is 03:00 New York in most weeks but 04:00 in the weeks when
+the US and Europe are on different clocks, and a fixed New York window would shift by an hour there. A past
+session on the other side of a clock change therefore still lines up with the one you are planning.
+
 24h markets: a plan from `exit.py --market 24h` carries "session": {"kind": "24h",
 "open": "08:20", "close": "17:00"} (New York time). The pool is then built from that window
 instead of 9:30 to 16:00: a full session is every 5-minute bar from the open to the close
@@ -123,14 +129,41 @@ class TMError(Exception):
     pass
 
 
-def make_session(open_min=OPEN_MIN, close_min=CLOSE_MIN, kind="stock"):
+ZONES = ("newyork", "london", "berlin")
+
+
+def _last_sunday(year, month):
+    d = datetime.date(year, month + 1, 1) - datetime.timedelta(days=1)
+    return d - datetime.timedelta(days=(d.weekday() + 1) % 7)
+
+
+def zone_offset(utc, zone):
+    """Hours from UTC for newyork, london or berlin at this naive UTC time (Europe switches at 01:00 UTC
+    on the last Sundays of March and October)."""
+    if zone == "newyork":
+        return eastern_offset(utc)
+    start = datetime.datetime.combine(_last_sunday(utc.year, 3), datetime.time(1, 0))
+    end = datetime.datetime.combine(_last_sunday(utc.year, 10), datetime.time(1, 0))
+    return (1 if start <= utc.replace(tzinfo=None) < end else 0) + (1 if zone == "berlin" else 0)
+
+
+def make_session(open_min=OPEN_MIN, close_min=CLOSE_MIN, kind="stock", tz=None, local_open=None, local_close=None):
     """The session a plan trades: open and close in minutes after midnight, New York time.
     A close at or before the open means the next day (a session that wraps past midnight)."""
     length = (close_min - open_min) % DAY_MIN or DAY_MIN
     if length % 5:
         raise TMError("the session %s to %s is not a whole number of 5-minute bars"
                       % (clock24(open_min), clock24(close_min)))
-    return {"kind": kind, "open_min": open_min, "close_min": close_min, "length": length, "bars": length // 5}
+    sess = {"kind": kind, "open_min": open_min, "close_min": close_min, "length": length, "bars": length // 5}
+    if tz and tz != "newyork" and local_open is not None:
+        if tz not in ZONES:
+            raise TMError("the plan's session zone %r is not newyork, london or berlin" % tz)
+        sess.update(tz=tz, local_open_min=local_open,
+                    local_length=((local_close - local_open) % DAY_MIN) or DAY_MIN)
+        if sess["local_length"] != length:
+            raise TMError("the plan's session is %d minutes in New York but %d in %s: its open and close do not "
+                          "agree" % (length, sess["local_length"], tz))
+    return sess
 
 
 STOCK_SESSION = {"kind": "stock", "open_min": OPEN_MIN, "close_min": CLOSE_MIN, "length": 390, "bars": SESSION_BARS}
@@ -140,8 +173,12 @@ def session_of(raw):
     """The session of a plan or entry dict: its "session" block, else the stock session."""
     sess = (raw or {}).get("session") or {}
     if sess.get("kind") == "24h":
+        lo, lc = sess.get("local_open"), sess.get("local_close")
         return make_session(parse_clock(sess.get("open") or "08:20", "session open", bare_pm=False),
-                            parse_clock(sess.get("close") or "17:00", "session close", bare_pm=False), "24h")
+                            parse_clock(sess.get("close") or "17:00", "session close", bare_pm=False), "24h",
+                            sess.get("tz"),
+                            parse_clock(lo, "session local_open", bare_pm=False) if lo else None,
+                            parse_clock(lc, "session local_close", bare_pm=False) if lc else None)
     return STOCK_SESSION
 
 
@@ -313,12 +350,17 @@ def chart_result(text, sym):
 
 def slot_of(local, sess):
     """(session date, slot) of a New York datetime in this session's window, or None."""
+    open_min = sess["open_min"]
+    if sess.get("tz"):                             # a named session: read the bar in the session's own zone
+        utc = eastern_to_utc(local)
+        local = utc + datetime.timedelta(hours=zone_offset(utc, sess["tz"]))
+        open_min = sess["local_open_min"]
     t = local.hour * 60 + local.minute
-    off = (t - sess["open_min"]) % DAY_MIN
+    off = (t - open_min) % DAY_MIN
     if off >= sess["length"]:
         return None
     day = local.date()
-    if t < sess["open_min"] and sess["open_min"] + sess["length"] > DAY_MIN:
+    if t < open_min and open_min + sess["length"] > DAY_MIN:
         day -= datetime.timedelta(days=1)          # the tail of a session that began yesterday evening
     return day.isoformat(), off // 5
 
@@ -642,8 +684,10 @@ def normalize_plan(raw, src="flags"):
     return {
         "symbol": sym, "side": side, "date": date, "setup": str(raw.get("setup") or "orb"),
         "entry": entry, "entry_time": clock12(at_slot(sess, k + 1)), "entry_bar": k,
-        "market": sess["kind"], "session": (None if sess["kind"] == "stock" else {
-            "kind": "24h", "open": clock24(sess["open_min"]), "close": clock24(sess["close_min"])}),
+        "market": sess["kind"], "session": (None if sess["kind"] == "stock" else dict(
+            {"kind": "24h", "open": clock24(sess["open_min"]), "close": clock24(sess["close_min"])},
+            **{k: v for k, v in (raw.get("session") or {}).items()
+               if k in ("tz", "local_open", "local_close", "name", "berlin")})),
         "stop": stop, "target": target, "risk_per_share": round(risk, 2),
         "target_r": round(((target - entry) if long else (entry - target)) / risk, 2),
         "opening_range": dict(orng, minutes=or_min) if isinstance(orng, dict) else {"minutes": or_min},

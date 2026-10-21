@@ -419,3 +419,71 @@ class ShortAnd24hCli(unittest.TestCase):
         code, text, _ = run(exitp, ["show", "--now", "2026-10-21 08:50"])
         self.assertEqual(code, 0)
         self.assertIn("GC=F short", text)
+
+
+class NamedSessions(unittest.TestCase):
+    """The london and ny sessions from trader-entry, through the exit plan: short, midpoint stop, R targets."""
+
+    def setUp(self):
+        self.old = os.getcwd()
+        self.tmp = tempfile.mkdtemp()
+        os.chdir(self.tmp)
+        os.mkdir("trader")
+
+    def tearDown(self):
+        os.chdir(self.old)
+        shutil.rmtree(self.tmp)
+
+    def entry_doc(self, **over):
+        doc = {"created_by": "trader-entry", "symbol": "GC=F", "setup": "orb", "side": "sell", "market": "24h",
+               "session": {"kind": "24h", "open": "03:00", "close": "09:30", "weekends": False, "tz": "london",
+                           "local_open": "08:00", "local_close": "14:30", "name": "london",
+                           "berlin": {"open": "09:00", "close": "15:30"}},
+               "date": "2026-10-21", "status": "triggered", "time": "3:40 AM", "bar_start": "03:35", "bar_index": 7,
+               "price": 98.4, "level": 99.0, "interval": "5m",
+               "opening_range": {"high": 101.0, "low": 99.0, "minutes": 30}}
+        doc.update(over)
+        with open(os.path.join("trader", "entry.json"), "w") as fh:
+            json.dump(doc, fh)
+
+    def plan(self, *extra):
+        return run(exitp, ["plan", "--now", "2026-10-21 03:45", "--json"] + list(extra))
+
+    def test_short_stop_at_the_range_midpoint_and_the_target_in_r(self):
+        self.entry_doc()
+        for target, want in (("2R", 95.2), ("3R", 93.6), ("1R", 96.8), ("1.5R", 96.0)):
+            code, text, err = self.plan("--target", target)
+            self.assertEqual((code, err), (0, ""))
+            p = json.loads(text)
+            self.assertEqual((p["side"], p["stop"], p["target"]), ("sell", 100.0, want), target)   # midpoint (101 + 99) / 2
+            self.assertEqual(p["risk_per_share"], 1.6)
+        self.assertEqual(json.loads(self.plan("--target", "3R")[1])["reward_risk"], 3.0)
+
+    def test_the_session_rides_along_with_its_zone_and_the_berlin_clock(self):
+        self.entry_doc()
+        p = json.loads(self.plan()[1])
+        self.assertEqual(p["session"], {"kind": "24h", "open": "03:00", "close": "09:30", "weekends": False,
+                                        "tz": "london", "local_open": "08:00", "local_close": "14:30",
+                                        "name": "london", "berlin": {"open": "09:00", "close": "15:30"}})
+        self.assertEqual(p["flat_by"], "09:25")                           # 5 minutes before the session closes
+        code, text, _ = run(exitp, ["plan", "--now", "2026-10-21 03:45"])
+        self.assertIn("Flat by       09:25 ET, win or lose (session 03:00 to 09:30 ET, 09:00 to 15:30 Berlin, 24h market)", text)
+
+    def test_ny_session_flattens_before_the_stock_close(self):
+        self.entry_doc(session={"kind": "24h", "open": "09:30", "close": "16:00", "weekends": False, "tz": "newyork",
+                                "local_open": "09:30", "local_close": "16:00", "name": "ny",
+                                "berlin": {"open": "15:30", "close": "22:00"}}, time="10:10 AM", bar_index=8)
+        code, text, err = run(exitp, ["plan", "--now", "2026-10-21 10:15", "--json"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(json.loads(text)["flat_by"], "15:55")
+
+    def test_the_long_side_of_the_same_range_has_its_stop_at_the_midpoint_too(self):
+        self.entry_doc(side="buy", price=101.5, time="3:45 AM", bar_index=8)
+        p = json.loads(self.plan()[1])
+        self.assertEqual((p["side"], p["stop"], p["target"]), ("buy", 100.0, 104.5))
+
+    def test_the_plan_is_refused_after_the_flat_by_time(self):
+        self.entry_doc(time="9:30 AM")
+        code, _, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("no time left to hold it", err)
